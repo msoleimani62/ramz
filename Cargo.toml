@@ -1,0 +1,20 @@
+[workspace]
+resolver = "2"
+members = [
+    "core",
+    "backends-age",
+    "backends-7z",
+    "cli",
+]
+
+[workspace.package]
+version = "0.1.0"
+edition = "2021"
+license = "MIT"
+repository = "https://github.com/msoleimani62/ramz"
+
+[workspace.dependencies]
+anyhow = "1"
+thiserror = "1"
+indicatif = "0.17"
+walkdir = "2"

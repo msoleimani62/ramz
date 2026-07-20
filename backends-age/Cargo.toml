@@ -1,0 +1,13 @@
+[package]
+name = "ramz-backend-age"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+
+[dependencies]
+ramz-core = { path = "../core" }
+anyhow.workspace = true
+age = { version = "0.10", features = ["armor"] }
+zstd = "0.13"
+secrecy = "0.8"
+tempfile = "3"

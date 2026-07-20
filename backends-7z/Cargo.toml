@@ -1,0 +1,11 @@
+[package]
+name = "ramz-backend-7z"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+
+[dependencies]
+ramz-core = { path = "../core" }
+anyhow.workspace = true
+regex = "1"
+which = "6"

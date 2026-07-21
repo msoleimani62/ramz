@@ -10,7 +10,7 @@ path = "src/main.rs"
 
 [dependencies]
 ramz-core = { path = "../core" }
-ramz-backend-age = { path = "../backends-age" }
+ramz-backends-age = { path = "../backends-age" }
 ramz-backend-7z = { path = "../backends-7z" }
 anyhow.workspace = true
 indicatif.workspace = true

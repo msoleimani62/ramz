@@ -72,7 +72,7 @@ impl Backend for SevenZBackend {
         let reader = BufReader::new(stdout);
         let percent_re = Regex::new(r"(\d+)%").unwrap();
 
-        for line in reader.lines().flatten() {
+        for line in reader.lines().map_while(|l| l.ok()) {
             if let Some(caps) = percent_re.captures(&line) {
                 if let Ok(pct) = caps[1].parse::<u64>() {
                     let processed = target.total_bytes.saturating_mul(pct) / 100;
@@ -84,7 +84,7 @@ impl Backend for SevenZBackend {
         let stderr = child.stderr.take().expect("stderr piped");
         let stderr_reader = BufReader::new(stderr);
         let mut stderr_lines = Vec::new();
-        for line in stderr_reader.lines().flatten() {
+        for line in stderr_reader.lines().map_while(|l| l.ok()) {
             if !line.trim().is_empty() {
                 stderr_lines.push(line);
             }
@@ -126,6 +126,39 @@ impl Backend for SevenZBackend {
         if !output.status.success() {
             let stderr = String::from_utf8_lossy(&output.stderr);
             return Err(RamzError::VerificationFailed(stderr.to_string()));
+        }
+
+        Ok(())
+    }
+}
+
+impl SevenZBackend {
+    pub fn extract(
+        &self,
+        archive_path: &Path,
+        output_dir: &Path,
+        password: Option<&str>,
+    ) -> Result<()> {
+        let binary = find_binary()?;
+        let mut cmd = Command::new(&binary);
+        cmd.arg("x")
+            .arg(archive_path)
+            .arg(format!("-o{}", output_dir.display()))
+            .arg("-y");
+
+        if let Some(pw) = password {
+            cmd.arg(format!("-p{pw}"));
+        }
+
+        cmd.stdout(Stdio::null()).stderr(Stdio::piped());
+
+        let output = cmd
+            .output()
+            .map_err(|e| RamzError::Backend(format!("failed to run {binary} extract: {e}")))?;
+
+        if !output.status.success() {
+            let stderr = String::from_utf8_lossy(&output.stderr);
+            return Err(RamzError::Backend(format!("extraction failed: {stderr}")));
         }
 
         Ok(())

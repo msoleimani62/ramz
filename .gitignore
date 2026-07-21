@@ -1,5 +1,6 @@
 /target
 *.7z
-*.sa-age
+*.age.tar.zst
+*.ramz-resume
 *.swp
 .DS_Store

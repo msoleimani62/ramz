@@ -1,31 +1,300 @@
-use std::fs::File;
-use std::io::Write;
+use std::fs;
+use std::io::{Read, Write};
 use std::path::Path;
 
-use age::secrecy::Secret;
-use ramz_core::{
-    pack_to_tar, unpack_from_tar, Backend, PackOptions, ProgressReporter, RamzError, Result, Target,
-};
+use age::secrecy::SecretString;
+use chacha20poly1305::{aead::Aead, ChaCha20Poly1305, Key, KeyInit, Nonce};
+use ramz_core::{Backend, PackOptions, ProgressReporter, RamzError, Result, SourceKind, Target};
+use rand::{rngs::OsRng, RngCore};
 
-pub struct AgeBackend;
+pub mod argon2_kdf;
+pub mod mlkem_hybrid;
 
-struct CountingWriter<'a, W: Write> {
-    inner: W,
-    written: u64,
-    progress: &'a mut dyn ProgressReporter,
+// binary magic bytes identifying the custom archive container (Argon2id / ML-KEM hybrid)
+// شناسه‌ی باینری فرمت آرشیو سفارشی (Argon2id / ML-KEM hybrid)
+const RAMZ_MAGIC: &[u8; 4] = b"RMZ1";
+const FLAG_ARGON2ID: u8 = 0b01;
+const FLAG_MLKEM: u8 = 0b10;
+
+// header layout (v1):
+// [0..4]   magic: "RMZ1"
+// [4]      flags: bitfield (FLAG_ARGON2ID | FLAG_MLKEM)
+// [5..9]   argon2_memory_kib: u32 LE
+// [9..13]  argon2_iterations: u32 LE
+// [13..17] argon2_parallelism: u32 LE
+// [17..33] salt: 16 bytes
+// then ML-KEM fields if FLAG_MLKEM set
+// then payload_nonce (12 bytes) + ciphertext
+
+pub struct AgeBackend {
+    use_argon2id: bool,
+    use_mlkem: bool,
 }
 
-impl<'a, W: Write> Write for CountingWriter<'a, W> {
-    fn write(&mut self, buf: &[u8]) -> std::io::Result<usize> {
-        let n = self.inner.write(buf)?;
-        self.written += n as u64;
-        self.progress.on_progress(self.written);
-        Ok(n)
+impl Default for AgeBackend {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
+impl AgeBackend {
+    pub fn new() -> Self {
+        Self {
+            use_argon2id: false,
+            use_mlkem: false,
+        }
     }
 
-    fn flush(&mut self) -> std::io::Result<()> {
-        self.inner.flush()
+    pub fn new_with_argon2id() -> Self {
+        Self {
+            use_argon2id: true,
+            use_mlkem: false,
+        }
     }
+
+    pub fn new_with_mlkem() -> Self {
+        Self {
+            use_argon2id: false,
+            use_mlkem: true,
+        }
+    }
+
+    pub fn decrypt_to_writer<R: Read, W: Write>(
+        &self,
+        reader: &mut R,
+        writer: &mut W,
+        password: Option<&str>,
+    ) -> Result<()> {
+        let decryptor = age::Decryptor::new(reader)
+            .map_err(|e| RamzError::Backend(format!("age decrypt init: {}", e)))?;
+
+        let mut reader = match decryptor {
+            age::Decryptor::Passphrase(decryptor) => {
+                let secret = password
+                    .map(|p| SecretString::from(p.to_string()))
+                    .ok_or_else(|| RamzError::Backend("age requires a password".into()))?;
+                decryptor
+                    .decrypt(&secret, None)
+                    .map_err(|e| RamzError::Backend(format!("age decrypt: {}", e)))?
+            }
+            _ => {
+                return Err(RamzError::Backend(
+                    "age archive requires passphrase decryption".into(),
+                ))
+            }
+        };
+
+        let mut buf = [0u8; 8192];
+        loop {
+            let n = reader.read(&mut buf).map_err(RamzError::Io)?;
+            if n == 0 {
+                break;
+            }
+            writer.write_all(&buf[..n]).map_err(RamzError::Io)?;
+        }
+        Ok(())
+    }
+
+    // encrypts the compressed payload into the custom container when Argon2id or ML-KEM is enabled
+    // رمزنگاری داده‌ی فشرده‌شده در قالب سفارشی وقتی Argon2id یا ML-KEM فعال باشه
+    fn pack_custom_container(
+        &self,
+        compressed: &[u8],
+        archive_path: &Path,
+        opts: &PackOptions,
+    ) -> Result<()> {
+        let password = opts
+            .password
+            .as_deref()
+            .ok_or_else(|| RamzError::Backend("age requires a password".into()))?;
+
+        let salt = argon2_kdf::generate_salt();
+        let argon2_key = argon2_kdf::derive_key(
+            password,
+            &salt,
+            opts.argon2_memory_kib,
+            opts.argon2_iterations,
+            opts.argon2_parallelism,
+        )
+        .map_err(RamzError::Backend)?;
+
+        let mut header: Vec<u8> = Vec::new();
+        header.extend_from_slice(RAMZ_MAGIC);
+
+        let mut flags: u8 = FLAG_ARGON2ID;
+        if self.use_mlkem {
+            flags |= FLAG_MLKEM;
+        }
+        header.push(flags);
+
+        // store Argon2 params in header for backward compatibility
+        // ذخیره‌ی پارامترهای Argon2 در هدر برای سازگاری به‌عقب
+        header.extend_from_slice(&opts.argon2_memory_kib.to_le_bytes());
+        header.extend_from_slice(&opts.argon2_iterations.to_le_bytes());
+        header.extend_from_slice(&opts.argon2_parallelism.to_le_bytes());
+
+        header.extend_from_slice(&salt);
+
+        let final_key: [u8; 32] = if self.use_mlkem {
+            let keypair = mlkem_hybrid::generate_keypair();
+            let (mlkem_ct, mlkem_shared) =
+                mlkem_hybrid::encapsulate(&keypair.public_key).map_err(RamzError::Backend)?;
+
+            // wrap the ML-KEM secret key using the Argon2id-derived key
+            // رمزنگاری کلید خصوصی ML-KEM با کلید مشتق‌شده از Argon2id
+            let dk_nonce = generate_nonce();
+            let wrap_cipher = ChaCha20Poly1305::new(Key::from_slice(argon2_key.as_ref()));
+            let dk_encrypted = wrap_cipher
+                .encrypt(Nonce::from_slice(&dk_nonce), keypair.secret_key.as_slice())
+                .map_err(|e| RamzError::Backend(format!("mlkem key wrap: {}", e)))?;
+
+            header.extend_from_slice(&(mlkem_ct.len() as u32).to_le_bytes());
+            header.extend_from_slice(&mlkem_ct);
+            header.extend_from_slice(&dk_nonce);
+            header.extend_from_slice(&(dk_encrypted.len() as u32).to_le_bytes());
+            header.extend_from_slice(&dk_encrypted);
+
+            mlkem_hybrid::combine_secrets(argon2_key.as_ref(), &mlkem_shared)
+        } else {
+            *argon2_key
+        };
+
+        let payload_nonce = generate_nonce();
+        let cipher = ChaCha20Poly1305::new(Key::from_slice(&final_key));
+        let ciphertext = cipher
+            .encrypt(Nonce::from_slice(&payload_nonce), compressed)
+            .map_err(|e| RamzError::Backend(format!("payload encrypt: {}", e)))?;
+
+        header.extend_from_slice(&payload_nonce);
+        header.extend_from_slice(&ciphertext);
+
+        fs::write(archive_path, &header)?;
+        Ok(())
+    }
+
+    // decrypts either archive format (standard age or the custom container) down to the raw tar bytes
+    // بازکردن آرشیو (هر دو فرمت: age استاندارد و کانتینر سفارشی) تا bytes تار فشرده‌نشده
+    fn decrypt_archive_to_tar(
+        &self,
+        archive_path: &Path,
+        password: Option<&str>,
+    ) -> Result<Vec<u8>> {
+        let mut file = fs::File::open(archive_path)?;
+        let mut raw = Vec::new();
+        file.read_to_end(&mut raw).map_err(RamzError::Io)?;
+
+        if raw.starts_with(RAMZ_MAGIC) {
+            self.decrypt_custom_container(&raw, password)
+        } else {
+            let mut decrypted = Vec::new();
+            self.decrypt_to_writer(&mut &raw[..], &mut decrypted, password)?;
+            decompress_zstd(&decrypted)
+        }
+    }
+
+    fn decrypt_custom_container(&self, raw: &[u8], password: Option<&str>) -> Result<Vec<u8>> {
+        let password =
+            password.ok_or_else(|| RamzError::Backend("age requires a password".into()))?;
+
+        let mut pos = RAMZ_MAGIC.len();
+        let flags = *raw
+            .get(pos)
+            .ok_or_else(|| RamzError::Backend("truncated archive header".into()))?;
+        pos += 1;
+
+        // read Argon2 params from header (backward compatibility)
+        // خواندن پارامترهای Argon2 از هدر (سازگاری به‌عقب)
+        let memory_kib = read_u32(raw, &mut pos)?;
+        let iterations = read_u32(raw, &mut pos)?;
+        let parallelism = read_u32(raw, &mut pos)?;
+
+        let salt = raw
+            .get(pos..pos + 16)
+            .ok_or_else(|| RamzError::Backend("truncated archive header".into()))?;
+        pos += 16;
+
+        let argon2_key =
+            argon2_kdf::derive_key(password, salt, memory_kib, iterations, parallelism)
+                .map_err(RamzError::Backend)?;
+
+        let final_key: [u8; 32] = if flags & FLAG_MLKEM != 0 {
+            let ct_len = read_u32(raw, &mut pos)?;
+            let mlkem_ct = raw
+                .get(pos..pos + ct_len as usize)
+                .ok_or_else(|| RamzError::Backend("truncated archive header".into()))?;
+            pos += ct_len as usize;
+
+            let dk_nonce = raw
+                .get(pos..pos + 12)
+                .ok_or_else(|| RamzError::Backend("truncated archive header".into()))?;
+            pos += 12;
+
+            let dk_enc_len = read_u32(raw, &mut pos)?;
+            let dk_encrypted = raw
+                .get(pos..pos + dk_enc_len as usize)
+                .ok_or_else(|| RamzError::Backend("truncated archive header".into()))?;
+            pos += dk_enc_len as usize;
+
+            let wrap_cipher = ChaCha20Poly1305::new(Key::from_slice(argon2_key.as_ref()));
+            let dk_bytes = wrap_cipher
+                .decrypt(Nonce::from_slice(dk_nonce), dk_encrypted)
+                .map_err(|_| RamzError::Backend("wrong password or corrupted archive".into()))?;
+
+            let mlkem_shared =
+                mlkem_hybrid::decapsulate(&dk_bytes, mlkem_ct).map_err(RamzError::Backend)?;
+
+            mlkem_hybrid::combine_secrets(argon2_key.as_ref(), &mlkem_shared)
+        } else {
+            *argon2_key
+        };
+
+        let payload_nonce = raw
+            .get(pos..pos + 12)
+            .ok_or_else(|| RamzError::Backend("truncated archive header".into()))?;
+        pos += 12;
+
+        let ciphertext = &raw[pos..];
+
+        let cipher = ChaCha20Poly1305::new(Key::from_slice(&final_key));
+        let compressed = cipher
+            .decrypt(Nonce::from_slice(payload_nonce), ciphertext)
+            .map_err(|_| RamzError::Backend("wrong password or corrupted archive".into()))?;
+
+        decompress_zstd(&compressed)
+    }
+
+    pub fn extract_to_dir(
+        &self,
+        archive_path: &Path,
+        output_dir: &Path,
+        password: Option<&str>,
+    ) -> Result<()> {
+        let decompressed = self.decrypt_archive_to_tar(archive_path, password)?;
+        ramz_core::unpack_from_tar(&decompressed[..], output_dir)
+    }
+}
+
+fn generate_nonce() -> [u8; 12] {
+    let mut nonce = [0u8; 12];
+    OsRng.fill_bytes(&mut nonce);
+    nonce
+}
+
+fn read_u32(raw: &[u8], pos: &mut usize) -> Result<u32> {
+    let bytes = raw
+        .get(*pos..*pos + 4)
+        .ok_or_else(|| RamzError::Backend("truncated archive header".into()))?;
+    *pos += 4;
+    Ok(u32::from_le_bytes(bytes.try_into().unwrap()))
+}
+
+fn decompress_zstd(compressed: &[u8]) -> Result<Vec<u8>> {
+    let mut decompressed = Vec::new();
+    let mut decoder = zstd::stream::Decoder::new(compressed)
+        .map_err(|e| RamzError::Backend(format!("zstd decoder: {}", e)))?;
+    std::io::copy(&mut decoder, &mut decompressed)
+        .map_err(|e| RamzError::Backend(format!("zstd decompress: {}", e)))?;
+    Ok(decompressed)
 }
 
 impl Backend for AgeBackend {
@@ -34,7 +303,7 @@ impl Backend for AgeBackend {
     }
 
     fn extension(&self) -> &'static str {
-        "ramz-age"
+        "age.tar.zst"
     }
 
     fn requires_external_binary(&self) -> bool {
@@ -48,72 +317,101 @@ impl Backend for AgeBackend {
         opts: &PackOptions,
         progress: &mut dyn ProgressReporter,
     ) -> Result<()> {
-        progress.set_total(target.total_bytes);
-
-        let password = opts
-            .password
-            .clone()
-            .ok_or_else(|| RamzError::Backend("age backend requires a password".into()))?;
-
-        let out_file = File::create(archive_path)?;
-
-        let encryptor = age::Encryptor::with_user_passphrase(Secret::new(password));
-        let age_writer = encryptor
-            .wrap_output(out_file)
-            .map_err(|e| RamzError::Backend(format!("age encryption init failed: {e}")))?;
-
-        let compression_level = opts.compression_level.clamp(1, 22) as i32;
-        let mut zstd_writer = zstd::stream::Encoder::new(age_writer, compression_level)
-            .map_err(|e| RamzError::Backend(format!("zstd init failed: {e}")))?;
-
-        {
-            let mut counting = CountingWriter {
-                inner: &mut zstd_writer,
-                written: 0,
-                progress,
-            };
-            pack_to_tar(target, &mut counting)?;
+        if archive_path.exists() && !opts.force_overwrite {
+            return Err(RamzError::ArchiveExists(archive_path.to_path_buf()));
         }
 
-        let age_writer = zstd_writer
-            .finish()
-            .map_err(|e| RamzError::Backend(format!("zstd finish failed: {e}")))?;
-        age_writer
-            .finish()
-            .map_err(|e| RamzError::Backend(format!("age finish failed: {e}")))?;
+        progress.set_total(target.total_bytes);
 
-        progress.finish("age encryption complete");
+        let temp_tar = tempfile::NamedTempFile::new()
+            .map_err(|e| RamzError::Backend(format!("temp file: {}", e)))?;
+
+        let mut tar_builder = tar::Builder::new(temp_tar.as_file());
+        match target.kind {
+            SourceKind::File => {
+                let name = target
+                    .path
+                    .file_name()
+                    .ok_or_else(|| RamzError::Backend("invalid file name".into()))?;
+                let mut f = fs::File::open(&target.path)?;
+                tar_builder.append_file(name, &mut f)?;
+            }
+            SourceKind::Directory => {
+                let name = target
+                    .path
+                    .file_name()
+                    .ok_or_else(|| RamzError::Backend("invalid directory name".into()))?;
+                tar_builder.append_dir_all(name, &target.path)?;
+            }
+        }
+        tar_builder.finish()?;
+
+        let temp_tar_path = temp_tar.path();
+        let mut compressed = Vec::new();
+        let level = if target.kind == SourceKind::File {
+            ramz_core::compression::effective_compression_level(
+                &target.path,
+                opts.compression_level,
+            )
+        } else {
+            opts.compression_level
+        };
+        let mut encoder = zstd::stream::Encoder::new(&mut compressed, level as i32)
+            .map_err(|e| RamzError::Backend(format!("zstd encoder: {}", e)))?;
+        let mut f = fs::File::open(temp_tar_path)?;
+        let mut buf = [0u8; 8192];
+        let mut processed = 0u64;
+        loop {
+            let n = f.read(&mut buf)?;
+            if n == 0 {
+                break;
+            }
+            encoder
+                .write_all(&buf[..n])
+                .map_err(|e| RamzError::Backend(e.to_string()))?;
+            processed += n as u64;
+            progress.on_progress(processed);
+        }
+        encoder
+            .finish()
+            .map_err(|e| RamzError::Backend(format!("zstd finish: {}", e)))?;
+
+        if self.use_argon2id || self.use_mlkem {
+            self.pack_custom_container(&compressed, archive_path, opts)?;
+        } else {
+            let encryptor = if let Some(ref pw) = opts.password {
+                let secret = SecretString::from(pw.clone());
+                age::Encryptor::with_user_passphrase(secret)
+            } else {
+                return Err(RamzError::Backend("age requires a password".into()));
+            };
+
+            let mut encrypted = fs::File::create(archive_path)?;
+            let mut writer = encryptor
+                .wrap_output(&mut encrypted)
+                .map_err(|e| RamzError::Backend(format!("age encrypt init: {}", e)))?;
+            writer
+                .write_all(&compressed)
+                .map_err(|e| RamzError::Backend(e.to_string()))?;
+            writer
+                .finish()
+                .map_err(|e| RamzError::Backend(format!("age encrypt finish: {}", e)))?;
+        }
+
+        progress.finish("Archive created with age backend");
         Ok(())
     }
 
     fn verify(&self, archive_path: &Path, password: Option<&str>) -> Result<()> {
-        let password = password.ok_or_else(|| {
-            RamzError::Backend("age backend requires a password to verify".into())
-        })?;
+        let decompressed = self.decrypt_archive_to_tar(archive_path, password)?;
 
-        let in_file = File::open(archive_path)?;
-        let decryptor = match age::Decryptor::new(in_file)
-            .map_err(|e| RamzError::VerificationFailed(e.to_string()))?
+        let mut tar = tar::Archive::new(&decompressed[..]);
+        for entry in tar
+            .entries()
+            .map_err(|e| RamzError::Backend(e.to_string()))?
         {
-            age::Decryptor::Passphrase(d) => d,
-            _ => {
-                return Err(RamzError::VerificationFailed(
-                    "unexpected age recipient type".into(),
-                ))
-            }
-        };
-
-        let reader = decryptor
-            .decrypt(&Secret::new(password.to_string()), None)
-            .map_err(|e| RamzError::VerificationFailed(e.to_string()))?;
-
-        let zstd_reader = zstd::stream::Decoder::new(reader)
-            .map_err(|e| RamzError::VerificationFailed(format!("zstd decode init failed: {e}")))?;
-
-        let tmp = tempfile::tempdir()
-            .map_err(|e| RamzError::Backend(format!("failed to create temp dir: {e}")))?;
-        unpack_from_tar(zstd_reader, tmp.path())
-            .map_err(|e| RamzError::VerificationFailed(e.to_string()))?;
+            let _ = entry.map_err(|e| RamzError::Backend(e.to_string()))?;
+        }
 
         Ok(())
     }
@@ -122,94 +420,264 @@ impl Backend for AgeBackend {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use ramz_core::{NullProgress, PackOptions, Target};
-    use std::io::Write;
     use tempfile::TempDir;
 
-    #[test]
-    fn test_age_backend_name() {
-        let backend = AgeBackend;
-        assert_eq!(backend.name(), "age");
-        assert_eq!(backend.extension(), "ramz-age");
-        assert!(!backend.requires_external_binary());
+    struct NullProgress;
+    impl ProgressReporter for NullProgress {
+        fn set_total(&mut self, _total_bytes: u64) {}
+        fn on_progress(&mut self, _processed_bytes: u64) {}
+        fn finish(&mut self, _message: &str) {}
     }
 
     #[test]
-    fn test_age_pack_and_verify() {
+    fn test_age_backend_file_roundtrip() {
         let tmp = TempDir::new().unwrap();
-        let source = tmp.path().join("source.txt");
-        let mut f = std::fs::File::create(&source).unwrap();
-        f.write_all(b"hello world from age test").unwrap();
+        let file = tmp.path().join("secret.txt");
+        let mut f = fs::File::create(&file).unwrap();
+        f.write_all(b"hello world from age").unwrap();
+        let archive = tmp.path().join("secret.txt.age.tar.zst");
 
-        let target = Target::detect(&source).unwrap();
-        let archive = tmp.path().join("test.ramz-age");
-
-        let backend = AgeBackend;
-        let mut progress = NullProgress;
+        let target = Target::detect(&file).unwrap();
+        let backend = AgeBackend::new();
         let opts = PackOptions {
-            password: Some("testpassword123".to_string()),
+            password: Some("test-password-123".to_string()),
             compression_level: 3,
             delete_source: false,
-            output_dir: None,
-            force_overwrite: false,
+            output_dir: Some(tmp.path().to_path_buf()),
+            force_overwrite: true,
+            argon2_memory_kib: 65536,
+            argon2_iterations: 3,
+            argon2_parallelism: 4,
         };
 
+        let mut progress = NullProgress;
         backend
             .pack(&target, &archive, &opts, &mut progress)
             .unwrap();
         assert!(archive.exists());
 
-        backend.verify(&archive, Some("testpassword123")).unwrap();
+        backend.verify(&archive, Some("test-password-123")).unwrap();
     }
 
     #[test]
-    fn test_age_verify_wrong_password() {
+    fn test_age_backend_directory_roundtrip() {
         let tmp = TempDir::new().unwrap();
-        let source = tmp.path().join("source.txt");
-        let mut f = std::fs::File::create(&source).unwrap();
-        f.write_all(b"hello world").unwrap();
+        let dir = tmp.path().join("project");
+        fs::create_dir(&dir).unwrap();
+        let mut f = fs::File::create(dir.join("main.rs")).unwrap();
+        f.write_all(b"fn main() {}").unwrap();
+        let archive = tmp.path().join("project.age.tar.zst");
 
-        let target = Target::detect(&source).unwrap();
-        let archive = tmp.path().join("test.ramz-age");
-
-        let backend = AgeBackend;
-        let mut progress = NullProgress;
+        let target = Target::detect(&dir).unwrap();
+        let backend = AgeBackend::new();
         let opts = PackOptions {
-            password: Some("correctpassword".to_string()),
-            compression_level: 3,
+            password: Some("dir-password-456".to_string()),
+            compression_level: 9,
             delete_source: false,
-            output_dir: None,
-            force_overwrite: false,
+            output_dir: Some(tmp.path().to_path_buf()),
+            force_overwrite: true,
+            argon2_memory_kib: 65536,
+            argon2_iterations: 3,
+            argon2_parallelism: 4,
         };
 
+        let mut progress = NullProgress;
+        backend
+            .pack(&target, &archive, &opts, &mut progress)
+            .unwrap();
+        assert!(archive.exists());
+
+        backend.verify(&archive, Some("dir-password-456")).unwrap();
+    }
+
+    #[test]
+    fn test_age_backend_wrong_password() {
+        let tmp = TempDir::new().unwrap();
+        let file = tmp.path().join("secret.txt");
+        fs::File::create(&file).unwrap();
+        let archive = tmp.path().join("secret.age.tar.zst");
+
+        let target = Target::detect(&file).unwrap();
+        let backend = AgeBackend::new();
+        let opts = PackOptions {
+            password: Some("correct-password".to_string()),
+            compression_level: 3,
+            delete_source: false,
+            output_dir: Some(tmp.path().to_path_buf()),
+            force_overwrite: true,
+            argon2_memory_kib: 65536,
+            argon2_iterations: 3,
+            argon2_parallelism: 4,
+        };
+
+        let mut progress = NullProgress;
         backend
             .pack(&target, &archive, &opts, &mut progress)
             .unwrap();
 
-        let result = backend.verify(&archive, Some("wrongpassword"));
+        let result = backend.verify(&archive, Some("wrong-password"));
         assert!(result.is_err());
     }
 
     #[test]
-    fn test_age_pack_no_password() {
+    fn test_age_backend_with_argon2id() {
         let tmp = TempDir::new().unwrap();
-        let source = tmp.path().join("source.txt");
-        std::fs::File::create(&source).unwrap();
+        let file = tmp.path().join("argon2.txt");
+        let mut f = fs::File::create(&file).unwrap();
+        f.write_all(b"argon2id test").unwrap();
+        let archive = tmp.path().join("argon2.age.tar.zst");
 
-        let target = Target::detect(&source).unwrap();
-        let archive = tmp.path().join("test.ramz-age");
-
-        let backend = AgeBackend;
-        let mut progress = NullProgress;
+        let target = Target::detect(&file).unwrap();
+        let backend = AgeBackend::new_with_argon2id();
         let opts = PackOptions {
-            password: None,
+            password: Some("argon2-password".to_string()),
             compression_level: 3,
             delete_source: false,
-            output_dir: None,
-            force_overwrite: false,
+            output_dir: Some(tmp.path().to_path_buf()),
+            force_overwrite: true,
+            argon2_memory_kib: 65536,
+            argon2_iterations: 3,
+            argon2_parallelism: 4,
         };
 
-        let result = backend.pack(&target, &archive, &opts, &mut progress);
-        assert!(matches!(result, Err(RamzError::Backend(_))));
+        let mut progress = NullProgress;
+        backend
+            .pack(&target, &archive, &opts, &mut progress)
+            .unwrap();
+        assert!(archive.exists());
+
+        backend.verify(&archive, Some("argon2-password")).unwrap();
+
+        let extract_dir = tmp.path().join("extracted_argon2");
+        backend
+            .extract_to_dir(&archive, &extract_dir, Some("argon2-password"))
+            .unwrap();
+        let extracted = fs::read(extract_dir.join("argon2.txt")).unwrap();
+        assert_eq!(extracted, b"argon2id test");
+    }
+
+    #[test]
+    fn test_age_backend_argon2id_wrong_password() {
+        let tmp = TempDir::new().unwrap();
+        let file = tmp.path().join("argon2.txt");
+        fs::File::create(&file).unwrap();
+        let archive = tmp.path().join("argon2.age.tar.zst");
+
+        let target = Target::detect(&file).unwrap();
+        let backend = AgeBackend::new_with_argon2id();
+        let opts = PackOptions {
+            password: Some("argon2-password".to_string()),
+            compression_level: 3,
+            delete_source: false,
+            output_dir: Some(tmp.path().to_path_buf()),
+            force_overwrite: true,
+            argon2_memory_kib: 65536,
+            argon2_iterations: 3,
+            argon2_parallelism: 4,
+        };
+
+        let mut progress = NullProgress;
+        backend
+            .pack(&target, &archive, &opts, &mut progress)
+            .unwrap();
+
+        let result = backend.verify(&archive, Some("wrong-password"));
+        assert!(result.is_err());
+    }
+
+    #[test]
+    fn test_age_backend_with_mlkem() {
+        let tmp = TempDir::new().unwrap();
+        let file = tmp.path().join("mlkem.txt");
+        let mut f = fs::File::create(&file).unwrap();
+        f.write_all(b"ml-kem test").unwrap();
+        let archive = tmp.path().join("mlkem.age.tar.zst");
+
+        let target = Target::detect(&file).unwrap();
+        let backend = AgeBackend::new_with_mlkem();
+        let opts = PackOptions {
+            password: Some("mlkem-password".to_string()),
+            compression_level: 3,
+            delete_source: false,
+            output_dir: Some(tmp.path().to_path_buf()),
+            force_overwrite: true,
+            argon2_memory_kib: 65536,
+            argon2_iterations: 3,
+            argon2_parallelism: 4,
+        };
+
+        let mut progress = NullProgress;
+        backend
+            .pack(&target, &archive, &opts, &mut progress)
+            .unwrap();
+        assert!(archive.exists());
+
+        backend.verify(&archive, Some("mlkem-password")).unwrap();
+
+        let extract_dir = tmp.path().join("extracted_mlkem");
+        backend
+            .extract_to_dir(&archive, &extract_dir, Some("mlkem-password"))
+            .unwrap();
+        let extracted = fs::read(extract_dir.join("mlkem.txt")).unwrap();
+        assert_eq!(extracted, b"ml-kem test");
+    }
+
+    #[test]
+    fn test_age_backend_mlkem_wrong_password() {
+        let tmp = TempDir::new().unwrap();
+        let file = tmp.path().join("mlkem.txt");
+        fs::File::create(&file).unwrap();
+        let archive = tmp.path().join("mlkem.age.tar.zst");
+
+        let target = Target::detect(&file).unwrap();
+        let backend = AgeBackend::new_with_mlkem();
+        let opts = PackOptions {
+            password: Some("mlkem-password".to_string()),
+            compression_level: 3,
+            delete_source: false,
+            output_dir: Some(tmp.path().to_path_buf()),
+            force_overwrite: true,
+            argon2_memory_kib: 65536,
+            argon2_iterations: 3,
+            argon2_parallelism: 4,
+        };
+
+        let mut progress = NullProgress;
+        backend
+            .pack(&target, &archive, &opts, &mut progress)
+            .unwrap();
+
+        let result = backend.verify(&archive, Some("wrong-password"));
+        assert!(result.is_err());
+    }
+
+    #[test]
+    fn test_age_backend_argon2id_custom_params() {
+        let tmp = TempDir::new().unwrap();
+        let file = tmp.path().join("custom.txt");
+        let mut f = fs::File::create(&file).unwrap();
+        f.write_all(b"custom params test").unwrap();
+        let archive = tmp.path().join("custom.age.tar.zst");
+
+        let target = Target::detect(&file).unwrap();
+        let backend = AgeBackend::new_with_argon2id();
+        let opts = PackOptions {
+            password: Some("custom-password".to_string()),
+            compression_level: 3,
+            delete_source: false,
+            output_dir: Some(tmp.path().to_path_buf()),
+            force_overwrite: true,
+            argon2_memory_kib: 32768,
+            argon2_iterations: 2,
+            argon2_parallelism: 2,
+        };
+
+        let mut progress = NullProgress;
+        backend
+            .pack(&target, &archive, &opts, &mut progress)
+            .unwrap();
+        assert!(archive.exists());
+
+        backend.verify(&archive, Some("custom-password")).unwrap();
     }
 }

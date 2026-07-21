@@ -4,6 +4,13 @@ use std::path::{Path, PathBuf};
 
 use thiserror::Error;
 
+pub mod compression;
+pub use compression::*;
+pub mod dry_run;
+pub use dry_run::*;
+pub mod resume;
+pub use resume::*;
+
 #[derive(Error, Debug)]
 pub enum RamzError {
     #[error("path not found: {0}")]
@@ -26,6 +33,15 @@ pub enum RamzError {
 
     #[error("integrity verification failed: {0}")]
     VerificationFailed(String),
+
+    #[error("resume state mismatch: {0}")]
+    ResumeMismatch(String),
+
+    #[error("dry run aborted")]
+    DryRunAborted,
+
+    #[error("incompatible backend flag: {0}")]
+    IncompatibleFlag(String),
 
     #[error(transparent)]
     Io(#[from] std::io::Error),
@@ -75,7 +91,7 @@ impl Target {
     }
 }
 
-fn dir_size(path: &Path) -> Result<u64> {
+pub fn dir_size(path: &Path) -> Result<u64> {
     let mut total = 0u64;
     if path.is_file() {
         return Ok(fs::metadata(path)?.len());
@@ -112,6 +128,9 @@ pub struct PackOptions {
     pub delete_source: bool,
     pub output_dir: Option<PathBuf>,
     pub force_overwrite: bool,
+    pub argon2_memory_kib: u32,
+    pub argon2_iterations: u32,
+    pub argon2_parallelism: u32,
 }
 
 impl Default for PackOptions {
@@ -122,6 +141,9 @@ impl Default for PackOptions {
             delete_source: false,
             output_dir: None,
             force_overwrite: false,
+            argon2_memory_kib: 65536,
+            argon2_iterations: 3,
+            argon2_parallelism: 4,
         }
     }
 }
@@ -326,15 +348,35 @@ mod tests {
     #[test]
     fn test_pack_to_tar_directory() {
         let tmp = TempDir::new().unwrap();
-        let dir = tmp.path().join("testdir");
+        let dir = tmp.path().join("project");
         fs::create_dir(&dir).unwrap();
-        let file = dir.join("test.txt");
-        let mut f = fs::File::create(&file).unwrap();
-        f.write_all(b"hello").unwrap();
+        let mut f = fs::File::create(dir.join("main.rs")).unwrap();
+        f.write_all(b"fn main() {}").unwrap();
 
         let target = Target::detect(&dir).unwrap();
         let mut buf = Vec::new();
         pack_to_tar(&target, &mut buf).unwrap();
         assert!(!buf.is_empty());
+    }
+
+    #[test]
+    fn test_unpack_from_tar() {
+        let tmp = TempDir::new().unwrap();
+        let file = tmp.path().join("test.txt");
+        let mut f = fs::File::create(&file).unwrap();
+        f.write_all(b"hello").unwrap();
+
+        let target = Target::detect(&file).unwrap();
+        let mut buf = Vec::new();
+        pack_to_tar(&target, &mut buf).unwrap();
+
+        let extract_dir = tmp.path().join("extracted");
+        fs::create_dir(&extract_dir).unwrap();
+        unpack_from_tar(&buf[..], &extract_dir).unwrap();
+
+        let extracted = extract_dir.join("test.txt");
+        assert!(extracted.exists());
+        let content = fs::read_to_string(&extracted).unwrap();
+        assert_eq!(content, "hello");
     }
 }

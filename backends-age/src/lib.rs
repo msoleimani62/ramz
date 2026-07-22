@@ -453,6 +453,7 @@ mod tests {
             argon2_memory_kib: 65536,
             argon2_iterations: 3,
             argon2_parallelism: 4,
+            secure_delete: false,
         };
 
         let mut progress = NullProgress;
@@ -484,6 +485,7 @@ mod tests {
             argon2_memory_kib: 65536,
             argon2_iterations: 3,
             argon2_parallelism: 4,
+            secure_delete: false,
         };
 
         let mut progress = NullProgress;
@@ -513,6 +515,7 @@ mod tests {
             argon2_memory_kib: 65536,
             argon2_iterations: 3,
             argon2_parallelism: 4,
+            secure_delete: false,
         };
 
         let mut progress = NullProgress;
@@ -543,6 +546,7 @@ mod tests {
             argon2_memory_kib: 65536,
             argon2_iterations: 3,
             argon2_parallelism: 4,
+            secure_delete: false,
         };
 
         let mut progress = NullProgress;
@@ -579,6 +583,7 @@ mod tests {
             argon2_memory_kib: 65536,
             argon2_iterations: 3,
             argon2_parallelism: 4,
+            secure_delete: false,
         };
 
         let mut progress = NullProgress;
@@ -609,6 +614,7 @@ mod tests {
             argon2_memory_kib: 65536,
             argon2_iterations: 3,
             argon2_parallelism: 4,
+            secure_delete: false,
         };
 
         let mut progress = NullProgress;
@@ -645,6 +651,7 @@ mod tests {
             argon2_memory_kib: 65536,
             argon2_iterations: 3,
             argon2_parallelism: 4,
+            secure_delete: false,
         };
 
         let mut progress = NullProgress;
@@ -675,6 +682,7 @@ mod tests {
             argon2_memory_kib: 32768,
             argon2_iterations: 2,
             argon2_parallelism: 2,
+            secure_delete: false,
         };
 
         let mut progress = NullProgress;

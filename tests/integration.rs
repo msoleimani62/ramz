@@ -45,6 +45,7 @@ fn test_age_backend_file_roundtrip() {
         argon2_memory_kib: 65536,
         argon2_iterations: 3,
         argon2_parallelism: 4,
+        secure_delete: false,
     };
 
     let mut progress = TestProgress;
@@ -94,6 +95,7 @@ fn test_age_backend_directory_roundtrip() {
         argon2_memory_kib: 65536,
         argon2_iterations: 3,
         argon2_parallelism: 4,
+        secure_delete: false,
     };
 
     let mut progress = TestProgress;
@@ -141,6 +143,7 @@ fn test_7z_backend_file_roundtrip() {
         argon2_memory_kib: 65536,
         argon2_iterations: 3,
         argon2_parallelism: 4,
+        secure_delete: false,
     };
 
     let mut progress = TestProgress;
@@ -185,6 +188,7 @@ fn test_7z_backend_directory_roundtrip() {
         argon2_memory_kib: 65536,
         argon2_iterations: 3,
         argon2_parallelism: 4,
+        secure_delete: false,
     };
 
     let mut progress = TestProgress;
@@ -223,6 +227,7 @@ fn test_age_backend_wrong_password_fails() {
         argon2_memory_kib: 65536,
         argon2_iterations: 3,
         argon2_parallelism: 4,
+        secure_delete: false,
     };
 
     let mut progress = TestProgress;
@@ -249,6 +254,7 @@ fn test_7z_backend_wrong_password_fails() {
         argon2_memory_kib: 65536,
         argon2_iterations: 3,
         argon2_parallelism: 4,
+        secure_delete: false,
     };
 
     let mut progress = TestProgress;
@@ -277,6 +283,7 @@ fn test_age_backend_large_file() {
         argon2_memory_kib: 65536,
         argon2_iterations: 3,
         argon2_parallelism: 4,
+        secure_delete: false,
     };
 
     let mut progress = TestProgress;
@@ -327,6 +334,7 @@ fn test_both_backends_with_special_characters() {
         argon2_memory_kib: 65536,
         argon2_iterations: 3,
         argon2_parallelism: 4,
+        secure_delete: false,
     };
     let mut progress = TestProgress;
     age.pack(&target, &archive_age, &opts, &mut progress).unwrap();
@@ -357,6 +365,7 @@ fn test_age_backend_argon2id_roundtrip() {
         argon2_memory_kib: 32768,
         argon2_iterations: 2,
         argon2_parallelism: 2,
+        secure_delete: false,
     };
 
     let mut progress = TestProgress;
@@ -391,6 +400,7 @@ fn test_age_backend_mlkem_roundtrip() {
         argon2_memory_kib: 65536,
         argon2_iterations: 3,
         argon2_parallelism: 4,
+        secure_delete: false,
     };
 
     let mut progress = TestProgress;
@@ -405,4 +415,69 @@ fn test_age_backend_mlkem_roundtrip() {
         .unwrap();
     let extracted = fs::read(extract_dir.join("mlkem.txt")).unwrap();
     assert_eq!(extracted, b"ml-kem integration test");
+}
+
+#[test]
+fn test_resume_state_roundtrip() {
+    let tmp = TempDir::new().unwrap();
+    let source = create_test_file(tmp.path(), "resume.txt", b"resume test content");
+    let archive = tmp.path().join("resume.age.tar.zst");
+
+    let checksum = ramz_core::resume::compute_file_checksum(&source).unwrap();
+
+    let state = ramz_core::resume::ResumeState {
+        source_path: source.clone(),
+        archive_path: archive.clone(),
+        backend_name: "age".to_string(),
+        total_bytes: 20,
+        processed_bytes: 0,
+        checksum: checksum.clone(),
+        password_hint: None,
+        created_at: "2024-01-01".to_string(),
+    };
+
+    // Save incomplete state (simulating interrupted pack)
+    ramz_core::resume::save_resume_state(&state, &archive).unwrap();
+    assert!(ramz_core::resume::is_resumable(&archive));
+
+    // Verify source unchanged
+    let loaded = ramz_core::resume::load_resume_state(&archive).unwrap().unwrap();
+    assert!(ramz_core::resume::verify_source_unchanged(&loaded).unwrap());
+
+    // Simulate source change
+    let mut f = fs::File::create(&source).unwrap();
+    f.write_all(b"modified content here").unwrap();
+
+    let loaded_after_change = ramz_core::resume::load_resume_state(&archive).unwrap().unwrap();
+    assert!(!ramz_core::resume::verify_source_unchanged(&loaded_after_change).unwrap());
+
+    // Clean up
+    ramz_core::resume::remove_resume_state(&archive).unwrap();
+    assert!(!ramz_core::resume::is_resumable(&archive));
+}
+
+#[test]
+fn test_secure_delete_integration() {
+    let tmp = TempDir::new().unwrap();
+    let source = create_test_file(tmp.path(), "sensitive.txt", b"secret data 12345");
+    let archive = tmp.path().join("sensitive.age.tar.zst");
+
+    let target = Target::detect(&source).unwrap();
+    let backend = AgeBackend::new();
+    let opts = PackOptions {
+        password: Some("delete-pw".to_string()),
+        compression_level: 3,
+        delete_source: true,
+        secure_delete: true,
+        output_dir: Some(tmp.path().to_path_buf()),
+        force_overwrite: true,
+        argon2_memory_kib: 65536,
+        argon2_iterations: 3,
+        argon2_parallelism: 4,
+    };
+
+    let mut progress = TestProgress;
+    backend.pack(&target, &archive, &opts, &mut progress).unwrap();
+    assert!(archive.exists());
+    assert!(!source.exists());
 }

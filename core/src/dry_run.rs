@@ -12,6 +12,7 @@ pub struct DryRunReport {
     pub output_path: std::path::PathBuf,
     pub backend_name: String,
     pub will_delete_source: bool,
+    pub will_secure_delete: bool,
     pub password_protected: bool,
 }
 
@@ -105,6 +106,7 @@ pub fn estimate_archive_size(
         output_path,
         backend_name: backend_name.to_string(),
         will_delete_source: opts.delete_source,
+        will_secure_delete: opts.secure_delete,
         password_protected: opts.password.is_some(),
     })
 }
@@ -140,6 +142,7 @@ mod tests {
         assert!(report.estimated_archive_size > 0);
         assert!(report.estimated_archive_size < 2000);
         assert!(!report.password_protected);
+        assert!(!report.will_secure_delete);
     }
 
     #[test]
@@ -167,5 +170,22 @@ mod tests {
         assert_eq!(format_size(1024), "1.00 KB");
         assert_eq!(format_size(1024 * 1024), "1.00 MB");
         assert_eq!(format_size(1024 * 1024 * 1024), "1.00 GB");
+    }
+
+    #[test]
+    fn test_estimate_with_secure_delete() {
+        let tmp = TempDir::new().unwrap();
+        let file = tmp.path().join("test.txt");
+        let mut f = std::fs::File::create(&file).unwrap();
+        f.write_all(&[0u8; 1000]).unwrap();
+
+        let target = Target::detect(&file).unwrap();
+        let opts = PackOptions {
+            secure_delete: true,
+            ..Default::default()
+        };
+        let report = estimate_archive_size(&target, &opts, "age").unwrap();
+
+        assert!(report.will_secure_delete);
     }
 }

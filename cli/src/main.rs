@@ -46,6 +46,12 @@ enum Commands {
         #[arg(short, long, help = "Delete source after successful verification")]
         delete_source: bool,
 
+        #[arg(
+            long,
+            help = "Securely overwrite source before deletion (slower, more secure)"
+        )]
+        secure_delete: bool,
+
         #[arg(short, long, help = "Force overwrite existing archive")]
         force: bool,
 
@@ -199,6 +205,14 @@ fn print_dry_run_report(report: &DryRunReport) {
             "No"
         }
     );
+    println!(
+        "║ Secure delete: {:<45} ║",
+        if report.will_secure_delete {
+            "Yes"
+        } else {
+            "No"
+        }
+    );
     println!("╠══════════════════════════════════════════════════╣");
     println!(
         "║ Already compressed files (will be stored): {:<3}     ║",
@@ -226,6 +240,7 @@ fn run(cli: Cli) -> anyhow::Result<()> {
             confirm_password,
             compression_level,
             delete_source,
+            secure_delete,
             force,
             backend,
             argon2id,
@@ -313,6 +328,7 @@ fn run(cli: Cli) -> anyhow::Result<()> {
                 argon2_memory_kib,
                 argon2_iterations,
                 argon2_parallelism,
+                secure_delete,
             };
 
             if dry_run {
@@ -381,11 +397,12 @@ fn run(cli: Cli) -> anyhow::Result<()> {
                 };
                 verify_result?;
                 println!("Verification passed. Deleting source...");
-                if target.kind == ramz_core::SourceKind::Directory {
-                    fs::remove_dir_all(&source)?;
-                } else {
-                    fs::remove_file(&source)?;
+
+                if secure_delete {
+                    println!("Using secure deletion (overwrite + remove)...");
                 }
+
+                ramz_core::secure_delete::delete_path(&source, secure_delete)?;
             }
 
             ramz_core::resume::remove_resume_state(&archive_path)?;
@@ -466,6 +483,7 @@ mod tests {
                 confirm_password: false,
                 compression_level: None,
                 delete_source: false,
+                secure_delete: false,
                 force: false,
                 backend: BackendChoice::SevenZ,
                 argon2id: false,
@@ -493,6 +511,7 @@ mod tests {
                 confirm_password: false,
                 compression_level: None,
                 delete_source: false,
+                secure_delete: false,
                 force: false,
                 backend: BackendChoice::SevenZ,
                 argon2id: true,
@@ -520,6 +539,7 @@ mod tests {
                 confirm_password: false,
                 compression_level: None,
                 delete_source: false,
+                secure_delete: false,
                 force: false,
                 backend: BackendChoice::Age,
                 argon2id: false,

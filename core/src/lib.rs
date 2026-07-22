@@ -10,6 +10,8 @@ pub mod dry_run;
 pub use dry_run::*;
 pub mod resume;
 pub use resume::*;
+pub mod secure_delete;
+pub use secure_delete::*;
 
 #[derive(Error, Debug)]
 pub enum RamzError {
@@ -42,6 +44,9 @@ pub enum RamzError {
 
     #[error("incompatible backend flag: {0}")]
     IncompatibleFlag(String),
+
+    #[error("secure delete failed: {0}")]
+    SecureDelete(String),
 
     #[error(transparent)]
     Io(#[from] std::io::Error),
@@ -131,6 +136,7 @@ pub struct PackOptions {
     pub argon2_memory_kib: u32,
     pub argon2_iterations: u32,
     pub argon2_parallelism: u32,
+    pub secure_delete: bool,
 }
 
 impl Default for PackOptions {
@@ -144,6 +150,7 @@ impl Default for PackOptions {
             argon2_memory_kib: 65536,
             argon2_iterations: 3,
             argon2_parallelism: 4,
+            secure_delete: false,
         }
     }
 }

@@ -161,9 +161,9 @@ fn get_password(confirm: bool) -> Result<String> {
 }
 
 fn print_dry_run_report(report: &DryRunReport) {
-    println!("\n╔══════════════════════════════════════════════════════╗");
+    println!("\n╔══════════════════════════════════════════════════╗");
     println!("║          DRY RUN PREVIEW                             ║");
-    println!("╠══════════════════════════════════════════════════════╣");
+    println!("╠══════════════════════════════════════════════════╣");
     println!("║ Source:        {:<45} ║", report.source_path.display());
     println!(
         "║ Type:          {:<45} ║",
@@ -199,7 +199,7 @@ fn print_dry_run_report(report: &DryRunReport) {
             "No"
         }
     );
-    println!("╠══════════════════════════════════════════════════════╣");
+    println!("╠══════════════════════════════════════════════════╣");
     println!(
         "║ Already compressed files (will be stored): {:<3}     ║",
         report.already_compressed_files.len()
@@ -214,12 +214,10 @@ fn print_dry_run_report(report: &DryRunReport) {
         "║ Compressible files: {:<3}      ║",
         report.compressible_files.len()
     );
-    println!("╚══════════════════════════════════════════════════════╝\n");
+    println!("╚══════════════════════════════════════════════════╝\n");
 }
 
-fn main() -> anyhow::Result<()> {
-    let cli = Cli::parse();
-
+fn run(cli: Cli) -> anyhow::Result<()> {
     match cli.command {
         Commands::Pack {
             source,
@@ -447,4 +445,95 @@ fn main() -> anyhow::Result<()> {
     }
 
     Ok(())
+}
+
+fn main() -> anyhow::Result<()> {
+    let cli = Cli::parse();
+    run(cli)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn test_mlkem_rejected_for_7z_backend() {
+        let cli = Cli {
+            command: Commands::Pack {
+                source: PathBuf::from("/tmp/fake"),
+                output: None,
+                password: Some("test".to_string()),
+                confirm_password: false,
+                compression_level: None,
+                delete_source: false,
+                force: false,
+                backend: BackendChoice::SevenZ,
+                argon2id: false,
+                mlkem: true,
+                dry_run: false,
+                resume: false,
+                argon2_memory_kib: 65536,
+                argon2_iterations: 3,
+                argon2_parallelism: 4,
+            },
+        };
+        let result = run(cli);
+        assert!(result.is_err());
+        let err_msg = format!("{}", result.unwrap_err());
+        assert!(err_msg.contains("--argon2id/--mlkem only supported with --backend age"));
+    }
+
+    #[test]
+    fn test_argon2id_rejected_for_7z_backend() {
+        let cli = Cli {
+            command: Commands::Pack {
+                source: PathBuf::from("/tmp/fake"),
+                output: None,
+                password: Some("test".to_string()),
+                confirm_password: false,
+                compression_level: None,
+                delete_source: false,
+                force: false,
+                backend: BackendChoice::SevenZ,
+                argon2id: true,
+                mlkem: false,
+                dry_run: false,
+                resume: false,
+                argon2_memory_kib: 65536,
+                argon2_iterations: 3,
+                argon2_parallelism: 4,
+            },
+        };
+        let result = run(cli);
+        assert!(result.is_err());
+        let err_msg = format!("{}", result.unwrap_err());
+        assert!(err_msg.contains("--argon2id/--mlkem only supported with --backend age"));
+    }
+
+    #[test]
+    fn test_age_backend_with_mlkem_accepted() {
+        let cli = Cli {
+            command: Commands::Pack {
+                source: PathBuf::from("/tmp/fake"),
+                output: None,
+                password: Some("test".to_string()),
+                confirm_password: false,
+                compression_level: None,
+                delete_source: false,
+                force: false,
+                backend: BackendChoice::Age,
+                argon2id: false,
+                mlkem: true,
+                dry_run: false,
+                resume: false,
+                argon2_memory_kib: 65536,
+                argon2_iterations: 3,
+                argon2_parallelism: 4,
+            },
+        };
+        let result = run(cli);
+        assert!(result.is_err());
+        let err_msg = format!("{}", result.unwrap_err());
+        assert!(!err_msg.contains("--argon2id/--mlkem only supported with --backend age"));
+    }
 }

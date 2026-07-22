@@ -6,6 +6,7 @@ use age::secrecy::SecretString;
 use chacha20poly1305::{aead::Aead, ChaCha20Poly1305, Key, KeyInit, Nonce};
 use ramz_core::{Backend, PackOptions, ProgressReporter, RamzError, Result, SourceKind, Target};
 use rand::{rngs::OsRng, RngCore};
+use zeroize::Zeroizing;
 
 pub mod argon2_kdf;
 pub mod mlkem_hybrid;
@@ -135,7 +136,8 @@ impl AgeBackend {
 
         header.extend_from_slice(&salt);
 
-        let final_key: [u8; 32] = if self.use_mlkem {
+        let mut final_key = Zeroizing::new([0u8; 32]);
+        if self.use_mlkem {
             let keypair = mlkem_hybrid::generate_keypair();
             let (mlkem_ct, mlkem_shared) =
                 mlkem_hybrid::encapsulate(&keypair.public_key).map_err(RamzError::Backend)?;
@@ -154,13 +156,14 @@ impl AgeBackend {
             header.extend_from_slice(&(dk_encrypted.len() as u32).to_le_bytes());
             header.extend_from_slice(&dk_encrypted);
 
-            mlkem_hybrid::combine_secrets(argon2_key.as_ref(), &mlkem_shared)
+            let combined = mlkem_hybrid::combine_secrets(argon2_key.as_ref(), &mlkem_shared);
+            final_key.copy_from_slice(&combined);
         } else {
-            *argon2_key
-        };
+            final_key.copy_from_slice(argon2_key.as_ref());
+        }
 
         let payload_nonce = generate_nonce();
-        let cipher = ChaCha20Poly1305::new(Key::from_slice(&final_key));
+        let cipher = ChaCha20Poly1305::new(Key::from_slice(final_key.as_ref()));
         let ciphertext = cipher
             .encrypt(Nonce::from_slice(&payload_nonce), compressed)
             .map_err(|e| RamzError::Backend(format!("payload encrypt: {}", e)))?;
@@ -217,7 +220,8 @@ impl AgeBackend {
             argon2_kdf::derive_key(password, salt, memory_kib, iterations, parallelism)
                 .map_err(RamzError::Backend)?;
 
-        let final_key: [u8; 32] = if flags & FLAG_MLKEM != 0 {
+        let mut final_key = Zeroizing::new([0u8; 32]);
+        if flags & FLAG_MLKEM != 0 {
             let ct_len = read_u32(raw, &mut pos)?;
             let mlkem_ct = raw
                 .get(pos..pos + ct_len as usize)
@@ -243,10 +247,11 @@ impl AgeBackend {
             let mlkem_shared =
                 mlkem_hybrid::decapsulate(&dk_bytes, mlkem_ct).map_err(RamzError::Backend)?;
 
-            mlkem_hybrid::combine_secrets(argon2_key.as_ref(), &mlkem_shared)
+            let combined = mlkem_hybrid::combine_secrets(argon2_key.as_ref(), &mlkem_shared);
+            final_key.copy_from_slice(&combined);
         } else {
-            *argon2_key
-        };
+            final_key.copy_from_slice(argon2_key.as_ref());
+        }
 
         let payload_nonce = raw
             .get(pos..pos + 12)
@@ -255,7 +260,7 @@ impl AgeBackend {
 
         let ciphertext = &raw[pos..];
 
-        let cipher = ChaCha20Poly1305::new(Key::from_slice(&final_key));
+        let cipher = ChaCha20Poly1305::new(Key::from_slice(final_key.as_ref()));
         let compressed = cipher
             .decrypt(Nonce::from_slice(payload_nonce), ciphertext)
             .map_err(|_| RamzError::Backend("wrong password or corrupted archive".into()))?;

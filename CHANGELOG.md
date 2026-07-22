@@ -74,52 +74,52 @@ and versioning follows [Semantic Versioning](https://semver.org/).
   archive was always encrypted with age's plain default KDF regardless of
   the flags. See Security below and the README's "Security design"
   section for exactly what each flag does now.
+- **`--resume` is now actually wired.** Checks the source checksum,
+  verifies archive state, and either skips a completed archive or reports
+  a clear mismatch error — instead of only suppressing the "archive
+  exists" check.
+- New `IncompatibleFlag` error variant: `--argon2id`/`--mlkem` combined
+  with `--backend seven-z` now produce a clear error instead of a silent
+  no-op.
+- Fixed cross-compilation failures for the `x86_64-unknown-linux-musl`
+  and `aarch64-linux-android` release targets (`zstd-sys` couldn't find
+  a suitable C cross-compiler; CI now installs `musl-tools` and points
+  `cc-rs` at the Android NDK's clang).
 - Removed unused-import compiler warnings across `cli` and `core`.
+
+### Added
+- `--secure-delete` flag: overwrites file content before removing the
+  source (best-effort — not a guarantee on SSDs with wear-leveling; this
+  limitation is documented, not glossed over).
+- `docs/ARCHIVE_FORMAT.md`: full byte-level specification of the `RMZ1`
+  custom container format.
+- `--argon2-memory-kib`, `--argon2-iterations`, `--argon2-parallelism`
+  flags for configurable Argon2 parameters (backward-compatible
+  defaults). Parameters are stored in the `RMZ1` container header so
+  archives remain decryptable even if defaults change later.
 
 ### Security
 - `--argon2id`: password-based key derivation now genuinely uses
-  memory-hard Argon2id (64 MiB, 3 iterations, parallelism 4) instead of
-  silently falling back to age's default scrypt-based KDF.
+  memory-hard Argon2id (64 MiB, 3 iterations, parallelism 4 by default)
+  instead of silently falling back to age's default scrypt-based KDF.
 - `--mlkem`: introduces a custom archive container (`RMZ1` magic bytes)
   that combines the Argon2id-derived key with a per-archive ML-KEM-768
   shared secret via SHA-256, as hybrid hardening. This is defense-in-depth,
   not a substitute for password strength — see the README for the exact
   threat model.
-- Added 8 new tests covering wrong-password rejection and full
-  pack→verify→extract round-trips for both `--argon2id` and `--mlkem`.
+- The final encryption key is now wrapped in `Zeroizing<[u8; 32]>`, and
+  `MlKemKeyPair` implements manual `Zeroize`/`ZeroizeOnDrop`, clearing
+  sensitive key material from memory when it goes out of scope
+  (defense-in-depth against cold-boot and memory-dump attacks).
+- Added 11 new tests covering wrong-password rejection, backend/flag
+  incompatibility, and full pack→verify→extract round-trips for
+  `--argon2id`, `--mlkem`, and `--secure-delete`.
 
 ### Known limitations
-- `--resume` is still not fully wired (tracked in ROADMAP.md).
 - `--argon2id`/`--mlkem` apply only to the `age` backend.
-- Derived keys are not yet zeroized in memory (tracked in ROADMAP.md).
 - No independent security review has been performed on the `RMZ1`
   container format.
-
-## [0.2.2] - 2026-07-21
-
-### Added
-- `--resume` is now fully wired: checks source checksum, verifies archive
-  state, and either skips completed archives or reports mismatch errors.
-- `--argon2-memory-kib`, `--argon2-iterations`, `--argon2-parallelism` CLI
-  flags for configurable Argon2 parameters (backward-compatible defaults).
-- Argon2 parameters are now stored in the `RMZ1` container header for
-  backward compatibility — archives created with different params remain
-  decryptable.
-- `IncompatibleFlag` error variant: `--argon2id`/`--mlkem` with `--backend 7z`
-  now produce a clear error instead of silent no-op.
-- `zeroize` integration: `MlKemKeyPair` implements manual `Zeroize` and
-  `ZeroizeOnDrop` to clear sensitive key material from memory.
-- `core/src/resume.rs` now uses `ramz_core::Result` for consistent error handling.
-
-### Fixed
-- `PackOptions` now includes `argon2_memory_kib`, `argon2_iterations`,
-  `argon2_parallelism` fields.
-- `.gitignore` updated to include `*.ramz-resume` files.
-- Removed `chrono` dependency; `created_at` uses `std::time::SystemTime`.
-- Removed `zeroize` from `core` crate (PathBuf does not implement Zeroize).
-
-### Security
-- Memory-zeroing of ML-KEM secret keys via manual `Zeroize`/`ZeroizeOnDrop`
-  on `MlKemKeyPair` (defense-in-depth against cold-boot and memory-dump attacks).
-- `RMZ1` container format now versioned with embedded Argon2 params,
-  preventing future decryption failures when defaults change.
+- ML-KEM hybrid hardening (`--mlkem`) does not protect against password
+  compromise — see the README's "Security design" section for the exact
+  threat model. A true recipient-key post-quantum workflow is planned
+  (tracked in ROADMAP.md).

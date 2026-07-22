@@ -8,6 +8,9 @@ license.workspace = true
 name = "ramz"
 path = "src/main.rs"
 
+[dev-dependencies]
+tempfile = "3"
+
 [dependencies]
 ramz-core = { path = "../core" }
 ramz-backends-age = { path = "../backends-age" }

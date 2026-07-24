@@ -1,24 +1,17 @@
 [package]
-name = "ramz-cli"
+name = "ramz-integration-tests"
 version.workspace = true
 authors.workspace = true
 edition.workspace = true
 license.workspace = true
 rust-version.workspace = true
+publish = false
 
-[[bin]]
-name = "ramz"
-path = "src/main.rs"
+[lib]
+path = "src/lib.rs"
 
-[dependencies]
+[dev-dependencies]
 ramz-core = { workspace = true }
 ramz-backends-age = { workspace = true }
 ramz-backend-7z = { workspace = true }
-clap = { workspace = true }
-indicatif = { workspace = true }
-rpassword = { workspace = true }
-anyhow = { workspace = true }
-dirs = { workspace = true }
-
-[dev-dependencies]
 tempfile = { workspace = true }

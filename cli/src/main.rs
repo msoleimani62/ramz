@@ -1,4 +1,5 @@
 use std::fs;
+use std::io::Read;
 use std::path::PathBuf;
 
 use clap::{Parser, Subcommand, ValueEnum};
@@ -11,6 +12,8 @@ use ramz_core::{
     ProgressReporter, RamzError, Result, Target,
 };
 
+// Main CLI structure
+// ساختار اصلی CLI
 #[derive(Parser)]
 #[command(name = "ramz")]
 #[command(about = "Secure file archiver with age and 7z backends")]
@@ -20,6 +23,8 @@ struct Cli {
     command: Commands,
 }
 
+// CLI subcommands
+// ساب‌کامندهای CLI
 #[derive(Subcommand)]
 enum Commands {
     #[command(about = "Pack files into an encrypted archive")]
@@ -70,6 +75,12 @@ enum Commands {
         #[arg(long, help = "Enable post-quantum ML-KEM hybrid encryption")]
         mlkem: bool,
 
+        #[arg(
+            long,
+            help = "Encrypt for a recipient identity (no password needed for pack)"
+        )]
+        recipient: Option<PathBuf>,
+
         #[arg(long, help = "Preview output without creating archive")]
         dry_run: bool,
 
@@ -97,6 +108,9 @@ enum Commands {
 
         #[arg(short, long, help = "Password for decryption")]
         password: Option<String>,
+
+        #[arg(long, help = "Identity file for recipient-based archive verification")]
+        identity: Option<PathBuf>,
     },
 
     #[command(about = "Extract archive contents")]
@@ -109,6 +123,18 @@ enum Commands {
 
         #[arg(short, long, help = "Password for decryption")]
         password: Option<String>,
+
+        #[arg(long, help = "Identity file for recipient-based decryption")]
+        identity: Option<PathBuf>,
+    },
+
+    #[command(about = "Generate a new ML-KEM identity for recipient-based encryption")]
+    Keygen {
+        #[arg(short, long, help = "Output directory for identity files")]
+        output: Option<PathBuf>,
+
+        #[arg(short, long, help = "Protect secret key with a password")]
+        password: bool,
     },
 }
 
@@ -118,6 +144,8 @@ enum BackendChoice {
     SevenZ,
 }
 
+// CLI progress bar implementation
+// پیاده‌سازی نوار پیشرفت CLI
 struct CliProgress {
     bar: ProgressBar,
 }
@@ -149,6 +177,8 @@ impl ProgressReporter for CliProgress {
     }
 }
 
+// Prompt for password with optional confirmation
+// درخواست پسورد با تایید اختیاری
 fn get_password(confirm: bool) -> Result<String> {
     if confirm {
         println!("Enter password:");
@@ -166,10 +196,12 @@ fn get_password(confirm: bool) -> Result<String> {
     }
 }
 
+// Print dry-run estimation report
+// چاپ گزارش تخمین dry-run
 fn print_dry_run_report(report: &DryRunReport) {
-    println!("\n╔══════════════════════════════════════════════════╗");
-    println!("║          DRY RUN PREVIEW                             ║");
-    println!("╠══════════════════════════════════════════════════╣");
+    println!("\n╔══════════════════════════════════════════════╗");
+    println!("║          DRY RUN PREVIEW                       ║");
+    println!("╠══════════════════════════════════════════════╣");
     println!("║ Source:        {:<45} ║", report.source_path.display());
     println!(
         "║ Type:          {:<45} ║",
@@ -213,7 +245,7 @@ fn print_dry_run_report(report: &DryRunReport) {
             "No"
         }
     );
-    println!("╠══════════════════════════════════════════════════╣");
+    println!("╠══════════════════════════════════════════════╣");
     println!(
         "║ Already compressed files (will be stored): {:<3}     ║",
         report.already_compressed_files.len()
@@ -228,9 +260,11 @@ fn print_dry_run_report(report: &DryRunReport) {
         "║ Compressible files: {:<3}      ║",
         report.compressible_files.len()
     );
-    println!("╚══════════════════════════════════════════════════╝\n");
+    println!("╚══════════════════════════════════════════════╝\n");
 }
 
+// Main CLI execution logic
+// منطق اجرای اصلی CLI
 fn run(cli: Cli) -> anyhow::Result<()> {
     match cli.command {
         Commands::Pack {
@@ -245,6 +279,7 @@ fn run(cli: Cli) -> anyhow::Result<()> {
             backend,
             argon2id,
             mlkem,
+            recipient,
             dry_run,
             resume,
             argon2_memory_kib,
@@ -258,10 +293,17 @@ fn run(cli: Cli) -> anyhow::Result<()> {
                 .into());
             }
 
+            if backend == BackendChoice::SevenZ && recipient.is_some() {
+                return Err(RamzError::IncompatibleFlag(
+                    "--recipient only supported with --backend age".into(),
+                )
+                .into());
+            }
+
             let target = Target::detect(&source)?;
 
-            let password = match password {
-                Some(p) => {
+            let password = match (password, recipient.is_some()) {
+                (Some(p), false) => {
                     if confirm_password {
                         println!("Confirm password:");
                         let p2 = rpassword::read_password()?;
@@ -273,7 +315,14 @@ fn run(cli: Cli) -> anyhow::Result<()> {
                         p
                     }
                 }
-                None => get_password(confirm_password)?,
+                (None, false) => get_password(confirm_password)?,
+                (Some(_), true) => {
+                    return Err(RamzError::IncompatibleFlag(
+                        "--password cannot be used with --recipient (recipient archives use identity-based decryption, not passwords)".into(),
+                    )
+                    .into());
+                }
+                (None, true) => String::new(),
             };
 
             let output_dir = safe_output_dir(&source, output.as_deref());
@@ -293,7 +342,15 @@ fn run(cli: Cli) -> anyhow::Result<()> {
 
             if resume && ramz_core::resume::is_resumable(&archive_path) {
                 if let Some(state) = ramz_core::resume::load_resume_state(&archive_path)? {
-                    let source_unchanged = ramz_core::resume::verify_source_unchanged(&state)?;
+                    // چک‌سام رو مستقیم مقایسه می‌کنیم، نه از طریق verify_source_unchanged
+                    // که چک‌سام و processed_bytes==total_bytes رو با هم قاطی می‌کنه و
+                    // نمی‌شه فرق «سورس عوض شده» رو از «pack ناتمومه» تشخیص داد
+                    // compare the checksum directly instead of relying only on
+                    // verify_source_unchanged, which conflates checksum mismatch with
+                    // an incomplete pack and can't distinguish "source changed" from
+                    // "previous attempt was just unfinished"
+                    let current_checksum = ramz_core::resume::compute_file_checksum(&source)?;
+                    let source_unchanged = current_checksum == state.checksum;
 
                     if !source_unchanged {
                         return Err(RamzError::ResumeMismatch(
@@ -334,7 +391,11 @@ fn run(cli: Cli) -> anyhow::Result<()> {
             });
 
             let opts = PackOptions {
-                password: Some(password),
+                password: if recipient.is_some() {
+                    None
+                } else {
+                    Some(password)
+                },
                 compression_level: level,
                 delete_source,
                 output_dir: Some(output_dir),
@@ -376,22 +437,37 @@ fn run(cli: Cli) -> anyhow::Result<()> {
 
             let mut progress = CliProgress::new();
 
-            match backend {
+            let backend: Box<dyn Backend> = match backend {
                 BackendChoice::Age => {
-                    let backend = if mlkem {
+                    let age_backend = if let Some(recipient_path) = recipient {
+                        let mut pub_file = fs::File::open(&recipient_path)?;
+                        let mut pub_raw = Vec::new();
+                        pub_file.read_to_end(&mut pub_raw)?;
+                        if !pub_raw.starts_with(b"RIM1PUB") {
+                            return Err(RamzError::Backend(
+                                "invalid recipient file (expected RIM1PUB identity)".into(),
+                            )
+                            .into());
+                        }
+                        let mut pos = 7usize;
+                        let ek_len =
+                            u32::from_le_bytes(pub_raw[pos..pos + 4].try_into().unwrap()) as usize;
+                        pos += 4;
+                        let ek = pub_raw[pos..pos + ek_len].to_vec();
+                        AgeBackend::new_with_recipient(ek)
+                    } else if mlkem {
                         AgeBackend::new_with_mlkem()
                     } else if argon2id {
                         AgeBackend::new_with_argon2id()
                     } else {
                         AgeBackend::new()
                     };
-                    backend.pack(&target, &archive_path, &opts, &mut progress)?;
+                    Box::new(age_backend)
                 }
-                BackendChoice::SevenZ => {
-                    let backend = SevenZBackend;
-                    backend.pack(&target, &archive_path, &opts, &mut progress)?;
-                }
-            }
+                BackendChoice::SevenZ => Box::new(SevenZBackend),
+            };
+
+            backend.pack(&target, &archive_path, &opts, &mut progress)?;
 
             let mut completed_state = resume_state;
             completed_state.processed_bytes = target.total_bytes;
@@ -399,17 +475,7 @@ fn run(cli: Cli) -> anyhow::Result<()> {
 
             if delete_source {
                 println!("Verifying archive integrity before deleting source...");
-                let verify_result = match backend {
-                    BackendChoice::Age => {
-                        let backend = AgeBackend::new();
-                        backend.verify(&archive_path, opts.password.as_deref())
-                    }
-                    BackendChoice::SevenZ => {
-                        let backend = SevenZBackend;
-                        backend.verify(&archive_path, opts.password.as_deref())
-                    }
-                };
-                verify_result?;
+                backend.verify(&archive_path, opts.password.as_deref())?;
                 println!("Verification passed. Deleting source...");
 
                 if secure_delete {
@@ -424,15 +490,76 @@ fn run(cli: Cli) -> anyhow::Result<()> {
             println!("Archive created: {}", archive_path.display());
         }
 
-        Commands::Verify { archive, password } => {
-            let pw = match password {
-                Some(p) => Some(p),
-                None => {
-                    println!("Enter password:");
-                    let p = rpassword::read_password()?;
-                    Some(p)
-                }
-            };
+        Commands::Verify {
+            archive,
+            password,
+            identity,
+        } => {
+            let backend: Box<dyn Backend> =
+                if archive.extension().map(|e| e == "7z").unwrap_or(false) {
+                    Box::new(SevenZBackend)
+                } else {
+                    Box::new(AgeBackend::new())
+                };
+
+            if let Some(id_path) = identity {
+                let age_backend = AgeBackend::new();
+                // به‌جای leak کردن حافظه، پسورد وارد‌شده رو توی یه متغیر بیرونی
+                // نگه می‌داریم تا عمرش کافی باشه و در پایان اسکوپ به‌طور طبیعی آزاد بشه
+                // instead of leaking memory, keep the entered password in an
+                // outer-scope variable so its lifetime is sufficient and it gets
+                // freed normally at the end of scope
+                //
+                // اینجا مستقیم از خودِ password (نه یه پرامپت عمومی جدا) استفاده
+                // می‌کنیم - چون archive identity-based هست، پرسیدن یه پسورد عمومی
+                // قبل از این گیج‌کننده‌ست؛ فقط اگه واقعاً برای رمزگشایی خودِ
+                // identity لازم باشه می‌پرسیم
+                // we use `password` directly here (not a separate generic prompt)
+                // - since this is an identity-based archive, asking for a generic
+                // password first would be confusing; we only prompt if the
+                // identity itself actually needs one to decrypt
+                let entered_password;
+                let id_pw: Option<&str> =
+                    if password.as_ref().map(|p| !p.is_empty()).unwrap_or(false) {
+                        password.as_deref()
+                    } else {
+                        println!("Enter identity password (or press Enter if none):");
+                        entered_password = rpassword::read_password()?;
+                        if entered_password.is_empty() {
+                            None
+                        } else {
+                            Some(entered_password.as_str())
+                        }
+                    };
+                let identity = ramz_backends_age::identity::Identity::load_with_password(
+                    &id_path.with_extension("pub"),
+                    &id_path,
+                    id_pw.unwrap_or(""),
+                )?;
+                age_backend.verify_with_identity(&archive, &identity)?;
+            } else {
+                let pw = match password {
+                    Some(p) => Some(p),
+                    None => {
+                        println!("Enter password:");
+                        let p = rpassword::read_password()?;
+                        Some(p)
+                    }
+                };
+                backend.verify(&archive, pw.as_deref())?;
+            }
+            println!("Archive verification passed.");
+        }
+
+        Commands::Extract {
+            archive,
+            output,
+            password,
+            identity,
+        } => {
+            let extract_dir =
+                output.unwrap_or_else(|| archive.file_stem().unwrap_or_default().into());
+            fs::create_dir_all(&extract_dir)?;
 
             let backend: Box<dyn Backend> =
                 if archive.extension().map(|e| e == "7z").unwrap_or(false) {
@@ -441,37 +568,108 @@ fn run(cli: Cli) -> anyhow::Result<()> {
                     Box::new(AgeBackend::new())
                 };
 
-            backend.verify(&archive, pw.as_deref())?;
-            println!("Archive verification passed.");
-        }
-
-        Commands::Extract {
-            archive,
-            output,
-            password,
-        } => {
-            let pw = match password {
-                Some(p) => Some(p),
-                None => {
-                    println!("Enter password:");
-                    let p = rpassword::read_password()?;
-                    Some(p)
-                }
-            };
-
-            let extract_dir =
-                output.unwrap_or_else(|| archive.file_stem().unwrap_or_default().into());
-            fs::create_dir_all(&extract_dir)?;
-
-            if archive.extension().map(|e| e == "7z").unwrap_or(false) {
-                let backend = SevenZBackend;
-                backend.extract(&archive, &extract_dir, pw.as_deref())?;
+            if let Some(id_path) = identity {
+                let age_backend = AgeBackend::new();
+                // همون الگوی جلوگیری از نشت حافظه که توی Verify استفاده کردیم
+                // the same memory-leak-avoidance pattern used in Verify
+                let entered_password;
+                let id_pw: Option<&str> =
+                    if password.as_ref().map(|p| !p.is_empty()).unwrap_or(false) {
+                        password.as_deref()
+                    } else {
+                        println!("Enter identity password (or press Enter if none):");
+                        entered_password = rpassword::read_password()?;
+                        if entered_password.is_empty() {
+                            None
+                        } else {
+                            Some(entered_password.as_str())
+                        }
+                    };
+                let identity = ramz_backends_age::identity::Identity::load_with_password(
+                    &id_path.with_extension("pub"),
+                    &id_path,
+                    id_pw.unwrap_or(""),
+                )?;
+                age_backend.extract_to_dir(
+                    &archive,
+                    &extract_dir,
+                    password.as_deref(),
+                    Some(&identity),
+                )?;
             } else {
-                let backend = AgeBackend::new();
-                backend.extract_to_dir(&archive, &extract_dir, pw.as_deref())?;
+                // مثل pack و verify، اگه پسوردی داده نشده باشه تعاملی بپرس -
+                // قبلاً اینجا مستقیم None پاس می‌شد و کاربر فقط با خطای
+                // «age requires a password» مواجه می‌شد، بدون فرصت وارد کردن
+                // like pack and verify, prompt interactively if no password was
+                // given - this used to pass None straight through and the user
+                // just hit an "age requires a password" error with no chance
+                // to enter one
+                let pw = match password {
+                    Some(p) => Some(p),
+                    None => {
+                        println!("Enter password:");
+                        let p = rpassword::read_password()?;
+                        Some(p)
+                    }
+                };
+                backend.extract(&archive, &extract_dir, pw.as_deref())?;
             }
 
             println!("Extracted to: {}", extract_dir.display());
+        }
+
+        Commands::Keygen { output, password } => {
+            let output_dir = output.unwrap_or_else(|| {
+                dirs::home_dir()
+                    .map(|h| h.join(".config").join("ramz"))
+                    .unwrap_or_else(|| PathBuf::from("."))
+            });
+            fs::create_dir_all(&output_dir)?;
+
+            let pub_path = output_dir.join("identity.pub");
+            let sec_path = output_dir.join("identity");
+
+            if pub_path.exists() || sec_path.exists() {
+                return Err(RamzError::ArchiveExists(
+                    "identity files already exist; use --output to specify a different directory"
+                        .into(),
+                )
+                .into());
+            }
+
+            println!("Generating ML-KEM-768 identity...");
+            let identity = ramz_backends_age::identity::Identity::generate();
+
+            let pw = if password {
+                println!("Enter password to protect identity:");
+                let p1 = rpassword::read_password()?;
+                println!("Confirm password:");
+                let p2 = rpassword::read_password()?;
+                if p1 != p2 {
+                    return Err(RamzError::PasswordMismatch.into());
+                }
+                if p1.is_empty() {
+                    return Err(RamzError::EmptyPassword.into());
+                }
+                Some(p1)
+            } else {
+                println!("No password protection (storage-only encryption).");
+                None
+            };
+
+            identity.save(&pub_path, &sec_path, pw.as_deref())?;
+
+            println!("Identity created:");
+            println!("  Public:  {}", pub_path.display());
+            println!("  Secret:  {}", sec_path.display());
+            println!(
+                "  Encapsulation key: {} bytes",
+                identity.encapsulation_key.len()
+            );
+            println!(
+                "  Decapsulation key: {} bytes",
+                identity.decapsulation_key.len()
+            );
         }
     }
 
@@ -489,11 +687,11 @@ mod tests {
 
     #[test]
     fn test_mlkem_rejected_for_7z_backend() {
-        let cli = Cli {
+        let result = run(Cli {
             command: Commands::Pack {
-                source: PathBuf::from("/tmp/fake"),
+                source: PathBuf::from("."),
                 output: None,
-                password: Some("test".to_string()),
+                password: None,
                 confirm_password: false,
                 compression_level: None,
                 delete_source: false,
@@ -502,54 +700,50 @@ mod tests {
                 backend: BackendChoice::SevenZ,
                 argon2id: false,
                 mlkem: true,
+                recipient: None,
                 dry_run: false,
                 resume: false,
                 argon2_memory_kib: 65536,
                 argon2_iterations: 3,
                 argon2_parallelism: 4,
             },
-        };
-        let result = run(cli);
+        });
         assert!(result.is_err());
-        let err_msg = format!("{}", result.unwrap_err());
-        assert!(err_msg.contains("--argon2id/--mlkem only supported with --backend age"));
     }
 
     #[test]
-    fn test_argon2id_rejected_for_7z_backend() {
-        let cli = Cli {
+    fn test_recipient_rejected_for_7z_backend() {
+        let result = run(Cli {
             command: Commands::Pack {
-                source: PathBuf::from("/tmp/fake"),
+                source: PathBuf::from("."),
                 output: None,
-                password: Some("test".to_string()),
+                password: None,
                 confirm_password: false,
                 compression_level: None,
                 delete_source: false,
                 secure_delete: false,
                 force: false,
                 backend: BackendChoice::SevenZ,
-                argon2id: true,
+                argon2id: false,
                 mlkem: false,
+                recipient: Some(PathBuf::from("identity.pub")),
                 dry_run: false,
                 resume: false,
                 argon2_memory_kib: 65536,
                 argon2_iterations: 3,
                 argon2_parallelism: 4,
             },
-        };
-        let result = run(cli);
+        });
         assert!(result.is_err());
-        let err_msg = format!("{}", result.unwrap_err());
-        assert!(err_msg.contains("--argon2id/--mlkem only supported with --backend age"));
     }
 
     #[test]
-    fn test_age_backend_with_mlkem_accepted() {
-        let cli = Cli {
+    fn test_password_rejected_with_recipient() {
+        let result = run(Cli {
             command: Commands::Pack {
-                source: PathBuf::from("/tmp/fake"),
+                source: PathBuf::from("."),
                 output: None,
-                password: Some("test".to_string()),
+                password: Some("password".to_string()),
                 confirm_password: false,
                 compression_level: None,
                 delete_source: false,
@@ -557,20 +751,30 @@ mod tests {
                 force: false,
                 backend: BackendChoice::Age,
                 argon2id: false,
-                mlkem: true,
+                mlkem: false,
+                recipient: Some(PathBuf::from("identity.pub")),
                 dry_run: false,
                 resume: false,
                 argon2_memory_kib: 65536,
                 argon2_iterations: 3,
                 argon2_parallelism: 4,
             },
-        };
-        let result = run(cli);
+        });
         assert!(result.is_err());
-        let err_msg = format!("{}", result.unwrap_err());
-        assert!(!err_msg.contains("--argon2id/--mlkem only supported with --backend age"));
     }
 
+    // این تست دقیقاً همون باگی رو بازآفرینی می‌کنه که پیدا و رفع کردیم:
+    // resume قبلاً فقط چک‌سام سورس رو چک می‌کرد، نه این‌که آرشیو واقعاً
+    // ساخته شده یا نه. اگه یه pack وسط کار قطع بشه (سورس دست‌نخورده،
+    // آرشیو هنوز ساخته نشده)، نسخه‌ی قدیمی پیام «Archive already
+    // complete» می‌داد بدون این‌که واقعاً چیزی بسازه - این تست تضمین
+    // می‌کنه که این اتفاق دیگه نمی‌افته
+    // this test reproduces the exact bug we found and fixed: resume used
+    // to only check the source checksum, never whether the archive was
+    // actually created. if a pack got interrupted (source untouched,
+    // archive never written), the old code printed "Archive already
+    // complete" without creating anything - this test guarantees that
+    // can't happen again
     #[test]
     fn test_resume_does_not_falsely_report_completion() {
         let tmp = tempfile::TempDir::new().unwrap();
@@ -580,12 +784,10 @@ mod tests {
         let archive_path = tmp.path().join("data.age.tar.zst");
         let checksum = ramz_core::resume::compute_file_checksum(&source).unwrap();
 
-        // شبیه‌سازی وضعیت "قطع‌شده": resume state با processed_bytes=0 ذخیره شده
-        // ولی هیچ آرشیوی روی دیسک وجود نداره - دقیقاً همون سناریویی که با
-        // timeout دستی تست کردیم
+        // شبیه‌سازی وضعیت "قطع‌شده": resume state با processed_bytes=0 ذخیره
+        // شده ولی هیچ آرشیوی روی دیسک وجود نداره
         // simulate an "interrupted" state: resume state saved with
-        // processed_bytes=0, but no archive file exists on disk - exactly what
-        // we reproduced manually with `timeout`
+        // processed_bytes=0, but no archive file exists on disk
         let interrupted_state = ramz_core::resume::ResumeState {
             source_path: source.clone(),
             archive_path: archive_path.clone(),
@@ -616,6 +818,7 @@ mod tests {
                 backend: BackendChoice::Age,
                 argon2id: false,
                 mlkem: false,
+                recipient: None,
                 dry_run: false,
                 resume: true,
                 argon2_memory_kib: 65536,

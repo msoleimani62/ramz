@@ -1,11 +1,15 @@
 [package]
 name = "ramz-backend-7z"
 version.workspace = true
+authors.workspace = true
 edition.workspace = true
 license.workspace = true
+rust-version.workspace = true
 
 [dependencies]
-ramz-core = { path = "../core" }
-anyhow.workspace = true
-regex = "1"
-which = "6"
+ramz-core = { workspace = true }
+regex = { workspace = true }
+which = { workspace = true }
+
+[dev-dependencies]
+tempfile = { workspace = true }

@@ -1,154 +1,179 @@
-use std::fs::{self, OpenOptions};
-use std::io::{Seek, SeekFrom, Write};
+use std::fs;
+use std::io::{Seek, Write};
 use std::path::Path;
 
-use rand::RngCore;
+use crate::Result;
 
-use crate::{RamzError, Result};
+// اندازه‌ی بافر برای نوشتن هر بلوک در طول overwrite
+// buffer size used for each write chunk during overwrite
+const CHUNK_SIZE: usize = 8192;
 
-// Number of overwrite passes for secure deletion (DoD 5220.22-M inspired: zero, ones, random)
-// تعداد دورهای overwrite برای حذف امن (الگوی DoD 5220.22-M: صفر، یک، تصادفی)
-const SECURE_DELETE_PASSES: usize = 3;
-
-// Buffer size for overwrite operations (8 KiB)
-// اندازه‌ی بافر برای عملیات overwrite (8 کیلوبایت)
-const OVERWRITE_BUFFER_SIZE: usize = 8192;
-
-/// Securely delete a single file by overwriting its content before unlinking.
-/// The file is overwritten with zeros, then ones, then random bytes.
-/// After each pass, the buffer is synced to disk to reduce caching effects.
-/// حذف امن یه فایل تکی با overwrite محتوا قبل از حذف از فایل‌سیستم.
-/// فایل با صفر، بعد یک، بعد بایت تصادفی overwrite می‌شه.
-/// بعد از هر دور، بافر sync می‌شه روی دیسک.
+// حذف امن یک فایل با بازنویسی محتواش قبل از حذف واقعی (۳ pass: صفر، یک،
+// تصادفی - هرکدوم تکرار می‌شه).
+//
+// ⚠️ هشدار صادقانه: این تضمین فیزیکی نیست. روی SSD/فلش با wear-leveling،
+// کنترلر درایو ممکنه واقعاً همون بلاک فیزیکی رو دوباره ننویسه (چون
+// نگاشت منطقی-به-فیزیکی داخلی داره) - یعنی داده‌ی قدیمی می‌تونه هنوز
+// جایی روی فلش باقی بمونه. این تابع فقط بازیابی از طریق ابزارهای معمول
+// فایل‌سیستمی/forensic سطح‌پایین رو سخت‌تر می‌کنه، نه غیرممکن روی همه‌ی
+// سخت‌افزارها. برای HDDهای سنتی (بدون wear-leveling)، این روش مؤثرتره.
+//
+// securely deletes a file by overwriting its content before actual removal
+// (3 passes: zeros, ones, random - each repeated).
+//
+// ⚠️ honest warning: this is not a physical guarantee. On SSDs/flash drives
+// with wear-leveling, the drive controller may not actually rewrite the
+// same physical block (due to internal logical-to-physical remapping) -
+// meaning old data could still persist somewhere on the flash. This
+// function only makes recovery via common filesystem/low-level forensic
+// tools harder, not impossible on all hardware. For traditional HDDs
+// (without wear-leveling), this method is more effective.
 pub fn secure_delete_file(path: &Path) -> Result<()> {
-    let metadata = fs::metadata(path).map_err(RamzError::Io)?;
-    let file_size = metadata.len() as usize;
+    let metadata = fs::metadata(path)?;
+    let size = metadata.len() as usize;
 
-    if file_size == 0 {
-        fs::remove_file(path).map_err(RamzError::Io)?;
-        return Ok(());
-    }
+    let mut file = fs::OpenOptions::new().write(true).open(path)?;
 
-    let mut file = OpenOptions::new()
-        .write(true)
-        .open(path)
-        .map_err(RamzError::Io)?;
+    let zeros = vec![0u8; CHUNK_SIZE];
+    let ones = vec![0xFFu8; CHUNK_SIZE];
 
-    for pass in 0..SECURE_DELETE_PASSES {
-        file.seek(SeekFrom::Start(0)).map_err(RamzError::Io)?;
-
-        let pattern: Vec<u8> = match pass {
-            0 => vec![0u8; OVERWRITE_BUFFER_SIZE],
-            1 => vec![0xFFu8; OVERWRITE_BUFFER_SIZE],
-            _ => {
-                let mut buf = vec![0u8; OVERWRITE_BUFFER_SIZE];
-                rand::thread_rng().fill_bytes(&mut buf);
-                buf
-            }
-        };
-
-        let mut written = 0usize;
-        while written < file_size {
-            let to_write = std::cmp::min(OVERWRITE_BUFFER_SIZE, file_size - written);
-            file.write_all(&pattern[..to_write])
-                .map_err(RamzError::Io)?;
-            written += to_write;
-        }
-
-        file.flush().map_err(RamzError::Io)?;
-        file.sync_all().map_err(RamzError::Io)?;
+    for _ in 0..3 {
+        overwrite_pass(&mut file, size, &zeros)?;
+        overwrite_pass(&mut file, size, &ones)?;
+        overwrite_random_pass(&mut file, size)?;
     }
 
     drop(file);
-    fs::remove_file(path).map_err(RamzError::Io)?;
+    fs::remove_file(path)?;
     Ok(())
 }
 
-/// Recursively securely delete all files in a directory, then remove the directory itself.
-/// Files are securely deleted; empty subdirectories are removed normally.
-/// حذف امن بازگشتی همه‌ی فایل‌های یه دایرکتوری، بعد حذف خود دایرکتوری.
-/// فایل‌ها secure delete می‌شن؛ زیردایرکتوری‌های خالی به‌صورت عادی حذف می‌شن.
-pub fn secure_delete_dir(path: &Path) -> Result<()> {
-    for entry in fs::read_dir(path).map_err(RamzError::Io)? {
-        let entry = entry.map_err(RamzError::Io)?;
-        let entry_path = entry.path();
+// یک pass از بازنویسی کل فایل با یه الگوی ثابت (صفر یا یک)
+// one overwrite pass across the whole file with a fixed pattern (zeros or ones)
+fn overwrite_pass(file: &mut fs::File, size: usize, pattern: &[u8]) -> Result<()> {
+    file.set_len(0)?;
+    file.set_len(size as u64)?;
+    file.rewind()?;
+    let mut written = 0usize;
+    while written < size {
+        let to_write = (size - written).min(pattern.len());
+        file.write_all(&pattern[..to_write])?;
+        written += to_write;
+    }
+    file.sync_all()?;
+    Ok(())
+}
 
-        if entry_path.is_file() {
-            secure_delete_file(&entry_path)?;
-        } else if entry_path.is_dir() {
-            secure_delete_dir(&entry_path)?;
+// یک pass از بازنویسی کل فایل با داده‌ی تصادفی
+// one overwrite pass across the whole file with random data
+fn overwrite_random_pass(file: &mut fs::File, size: usize) -> Result<()> {
+    file.set_len(0)?;
+    file.set_len(size as u64)?;
+    file.rewind()?;
+    let mut written = 0usize;
+    while written < size {
+        let to_write = (size - written).min(CHUNK_SIZE);
+        let random: Vec<u8> = (0..to_write).map(|_| rand::random::<u8>()).collect();
+        file.write_all(&random)?;
+        written += to_write;
+    }
+    file.sync_all()?;
+    Ok(())
+}
+
+// حذف امن بازگشتی یک پوشه: تک‌تک فایل‌های داخلش (شامل زیرپوشه‌ها) رو
+// قبل از حذف نهایی overwrite می‌کنه - نه فقط یه remove_dir_all ساده
+// recursively secure-deletes a directory: overwrites every file inside it
+// (including subdirectories) before final removal - not just a plain
+// remove_dir_all
+fn secure_delete_dir(dir: &Path) -> Result<()> {
+    for entry in walkdir::WalkDir::new(dir).contents_first(true).into_iter() {
+        let entry = entry
+            .map_err(|e| crate::RamzError::SecureDelete(format!("directory walk failed: {}", e)))?;
+        let path = entry.path();
+        if path.is_file() {
+            secure_delete_file(path)?;
+        } else if path.is_dir() && path != dir {
+            fs::remove_dir(path)?;
         }
     }
-
-    fs::remove_dir(path).map_err(RamzError::Io)?;
+    fs::remove_dir_all(dir)?;
     Ok(())
 }
 
-/// Delete a file or directory, optionally using secure overwrite.
-/// If `secure` is false, uses standard fast deletion.
-/// If `secure` is true, overwrites file content before unlinking.
-/// حذف فایل یا دایرکتوری، با گزینه‌ی overwrite امن.
-/// اگه `secure` false باشه، از حذف سریع استاندارد استفاده می‌شه.
-/// اگه `secure` true باشه، قبل از حذف overwrite انجام می‌شه.
+// حذف یک مسیر (فایل یا پوشه)، با امکان استفاده از حذف امن.
+// برای پوشه‌ها، secure=true یعنی همه‌ی فایل‌های داخلش هم امن پاک می‌شن،
+// نه فقط خودِ پوشه
+// deletes a path (file or directory), optionally using secure deletion.
+// for directories, secure=true means every file inside is also securely
+// wiped, not just the directory entry itself
 pub fn delete_path(path: &Path, secure: bool) -> Result<()> {
-    if !path.exists() {
-        return Ok(());
-    }
-
     if path.is_file() {
         if secure {
-            secure_delete_file(path)
+            secure_delete_file(path)?;
         } else {
-            fs::remove_file(path).map_err(RamzError::Io)
+            fs::remove_file(path)?;
         }
     } else if path.is_dir() {
         if secure {
-            secure_delete_dir(path)
+            secure_delete_dir(path)?;
         } else {
-            fs::remove_dir_all(path).map_err(RamzError::Io)
+            fs::remove_dir_all(path)?;
         }
-    } else {
-        Ok(())
     }
+    Ok(())
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
-    use std::fs::File;
     use tempfile::TempDir;
 
     #[test]
-    fn test_secure_delete_file_overwrites_content() {
+    fn test_delete_path_file() {
         let tmp = TempDir::new().unwrap();
-        let file_path = tmp.path().join("secret.txt");
-
-        let original = b"this is sensitive data that must be destroyed";
-        {
-            let mut f = File::create(&file_path).unwrap();
-            f.write_all(original).unwrap();
-            f.flush().unwrap();
-        }
-
-        let size_before = fs::metadata(&file_path).unwrap().len() as usize;
-        assert_eq!(size_before, original.len());
-
-        secure_delete_file(&file_path).unwrap();
-        assert!(!file_path.exists());
+        let file = tmp.path().join("test.txt");
+        fs::write(&file, b"hello").unwrap();
+        delete_path(&file, false).unwrap();
+        assert!(!file.exists());
     }
 
     #[test]
-    fn test_standard_delete_file_fast() {
+    fn test_delete_path_directory() {
         let tmp = TempDir::new().unwrap();
-        let file_path = tmp.path().join("fast.txt");
+        let dir = tmp.path().join("subdir");
+        fs::create_dir(&dir).unwrap();
+        fs::write(dir.join("file.txt"), b"hello").unwrap();
+        delete_path(&dir, false).unwrap();
+        assert!(!dir.exists());
+    }
 
-        {
-            let mut f = File::create(&file_path).unwrap();
-            f.write_all(b"fast delete test").unwrap();
-        }
+    #[test]
+    fn test_secure_delete_file() {
+        let tmp = TempDir::new().unwrap();
+        let file = tmp.path().join("secret.txt");
+        fs::write(&file, b"top secret data that must be destroyed").unwrap();
+        secure_delete_file(&file).unwrap();
+        assert!(!file.exists());
+    }
 
-        delete_path(&file_path, false).unwrap();
-        assert!(!file_path.exists());
+    #[test]
+    fn test_secure_delete_empty_file() {
+        let tmp = TempDir::new().unwrap();
+        let file = tmp.path().join("empty.txt");
+        fs::write(&file, b"").unwrap();
+        secure_delete_file(&file).unwrap();
+        assert!(!file.exists());
+    }
+
+    #[test]
+    fn test_secure_delete_large_file() {
+        let tmp = TempDir::new().unwrap();
+        let file = tmp.path().join("large.bin");
+        let data = vec![0x42u8; 500_000];
+        fs::write(&file, &data).unwrap();
+        secure_delete_file(&file).unwrap();
+        assert!(!file.exists());
     }
 
     #[test]
@@ -156,64 +181,24 @@ mod tests {
         let tmp = TempDir::new().unwrap();
         let dir = tmp.path().join("nested");
         fs::create_dir(&dir).unwrap();
-        fs::create_dir(dir.join("sub")).unwrap();
+        fs::write(dir.join("a.txt"), b"file a").unwrap();
+        let sub = dir.join("sub");
+        fs::create_dir(&sub).unwrap();
+        fs::write(sub.join("b.txt"), b"file b").unwrap();
 
-        {
-            let mut f = File::create(dir.join("a.txt")).unwrap();
-            f.write_all(b"file a").unwrap();
-        }
-        {
-            let mut f = File::create(dir.join("sub/b.txt")).unwrap();
-            f.write_all(b"file b").unwrap();
-        }
-
-        secure_delete_dir(&dir).unwrap();
+        delete_path(&dir, true).unwrap();
         assert!(!dir.exists());
-    }
-
-    #[test]
-    fn test_delete_path_with_secure_flag() {
-        let tmp = TempDir::new().unwrap();
-        let file = tmp.path().join("flag_test.txt");
-
-        {
-            let mut f = File::create(&file).unwrap();
-            f.write_all(b"test content").unwrap();
-        }
-
-        delete_path(&file, true).unwrap();
-        assert!(!file.exists());
     }
 
     #[test]
     fn test_delete_nonexistent_path_is_noop() {
         let tmp = TempDir::new().unwrap();
         let ghost = tmp.path().join("does_not_exist.txt");
-        delete_path(&ghost, true).unwrap();
-        delete_path(&ghost, false).unwrap();
-    }
-
-    #[test]
-    fn test_secure_delete_empty_file() {
-        let tmp = TempDir::new().unwrap();
-        let empty = tmp.path().join("empty.txt");
-        File::create(&empty).unwrap();
-        secure_delete_file(&empty).unwrap();
-        assert!(!empty.exists());
-    }
-
-    #[test]
-    fn test_secure_delete_large_file() {
-        let tmp = TempDir::new().unwrap();
-        let large = tmp.path().join("large.bin");
-
-        let data = vec![0xABu8; 1024 * 1024]; // 1 MiB
-        {
-            let mut f = File::create(&large).unwrap();
-            f.write_all(&data).unwrap();
-        }
-
-        secure_delete_file(&large).unwrap();
-        assert!(!large.exists());
+        // نباید panic کنه یا خطای غیرمنتظره بده - مسیری که وجود نداره
+        // رو باید بی‌صدا نادیده بگیره
+        // must not panic or error unexpectedly - a nonexistent path should
+        // be silently ignored
+        assert!(delete_path(&ghost, false).is_ok());
+        assert!(delete_path(&ghost, true).is_ok());
     }
 }

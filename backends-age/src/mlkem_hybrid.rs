@@ -3,30 +3,20 @@ use ml_kem::{
     Ciphertext, DecapsulationKey, EncapsulationKey, KeyExport, MlKem768,
 };
 use sha2::{Digest, Sha256};
-use zeroize::{Zeroize, ZeroizeOnDrop};
+use zeroize::Zeroizing;
 
-#[derive(Debug)]
 pub struct MlKemKeyPair {
     pub public_key: Vec<u8>,
-    pub secret_key: Vec<u8>,
+    pub secret_key: Zeroizing<Vec<u8>>,
 }
-
-impl Zeroize for MlKemKeyPair {
-    fn zeroize(&mut self) {
-        self.public_key.zeroize();
-        self.secret_key.zeroize();
-    }
-}
-
-impl ZeroizeOnDrop for MlKemKeyPair {}
 
 pub fn generate_keypair() -> MlKemKeyPair {
-    // uses the crate's internal system-secure RNG via the `getrandom` feature
     // استفاده از رابط داخلی crate برای تولید کلید با تصادفی‌ساز امن سیستم
+    // uses the crate's internal system-secure RNG via the `getrandom` feature
     let (dk, ek) = MlKem768::generate_keypair();
     MlKemKeyPair {
         public_key: ek.to_bytes().to_vec(),
-        secret_key: dk.to_bytes().to_vec(),
+        secret_key: Zeroizing::new(dk.to_bytes().to_vec()),
     }
 }
 
@@ -38,8 +28,8 @@ pub fn encapsulate(public_key_bytes: &[u8]) -> Result<(Vec<u8>, Vec<u8>), String
     let ek = EncapsulationKey::<MlKem768>::new(&key_bytes)
         .map_err(|_| "invalid public key".to_string())?;
 
-    // the new encapsulate() signature no longer takes a manual rng
-    // امضای جدید encapsulate() دیگه rng دستی نمی‌گیره
+    // امضای encapsulate() دیگه rng دستی نمی‌گیره
+    // the encapsulate() signature doesn't take a manual rng
     let (ciphertext, shared_secret): (Ciphertext<MlKem768>, _) = ek.encapsulate();
 
     Ok((
@@ -64,10 +54,10 @@ pub fn decapsulate(secret_key_bytes: &[u8], ciphertext_bytes: &[u8]) -> Result<V
     Ok(shared_secret.to_vec())
 }
 
-pub fn combine_secrets(x25519_secret: &[u8], mlkem_secret: &[u8]) -> [u8; 32] {
+pub fn combine_secrets(secret_a: &[u8], secret_b: &[u8]) -> [u8; 32] {
     let mut hasher = Sha256::new();
-    hasher.update(x25519_secret);
-    hasher.update(mlkem_secret);
+    hasher.update(secret_a);
+    hasher.update(secret_b);
 
     let result = hasher.finalize();
 

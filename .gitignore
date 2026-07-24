@@ -1,7 +1,8 @@
 /target
-*.7z
+**/*.rs.bk
 *.age.tar.zst
-*.ramz-resume
-*.swp
-.DS_Store
-tree_main.md
+*.7z
+*.resume
+*.pub
+identity
+!docs/IDENTITY_FORMAT.md

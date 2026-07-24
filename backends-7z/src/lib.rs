@@ -130,10 +130,8 @@ impl Backend for SevenZBackend {
 
         Ok(())
     }
-}
 
-impl SevenZBackend {
-    pub fn extract(
+    fn extract(
         &self,
         archive_path: &Path,
         output_dir: &Path,

@@ -1,125 +1,87 @@
 # Changelog
 
-All notable changes to this project are documented here.
-The format follows [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
-and versioning follows [Semantic Versioning](https://semver.org/).
+All notable changes to this project will be documented in this file.
 
-## [Unreleased]
+## [0.3.0] - 2026-07-22
 
 ### Added
-- Initial workspace scaffold: `core`, `backends-age`, `backends-7z`, `cli`.
-- `Backend` trait as the shared interface for all compression/encryption engines.
-- `age` engine (default): X25519 + ChaCha20-Poly1305 via the `age` crate, zstd
-  compression, streaming progress reporting.
-- `7z` engine (compatibility mode): shells out to a system `7z`/`7zz`/`7za`
-  binary for interoperability with other tools.
-- CLI (`ramz`) with `clap`-based argument parsing, `indicatif` progress bar,
-  confirmed password prompts via `rpassword`.
-- Mandatory post-write integrity verification before source deletion.
-- Bilingual (Persian/English) README.
-- MIT `LICENSE` file.
-- `safe_output_dir()` helper to prevent invalid output paths on root-level sources.
-- `read_and_confirm_password()` centralized in `core`, removing duplicate logic from the CLI.
-- Unit tests across `core`, `backends-age`, and `backends-7z`.
-- `rustfmt.toml` for consistent code style.
-- Local pre-commit hooks for fmt, clippy, and test.
+- **Recipient-based encryption (`ramz keygen`, `--recipient`)**: True post-quantum encryption where only the holder of the identity secret key can decrypt. No password involved in the encryption path.
+- `ramz keygen` subcommand: Generate ML-KEM-768 identity keypairs
+- `--recipient <path>` flag for `ramz pack`: Encrypt for a specific recipient
+- `--identity <path>` flag for `ramz verify` and `ramz extract`: Decrypt recipient-based archives
+- `docs/IDENTITY_FORMAT.md`: Specification for RIM1 identity format
+- `verify_with_identity()` and `extract_to_dir()` methods on `AgeBackend`
+- Integration tests for recipient roundtrip, password-protected identities, and error cases
+- `Backend::extract()` trait method for unified extraction interface
+- Dual `MIT OR Apache-2.0` licensing (adds a patent grant on top of MIT; standard for the Rust ecosystem)
+- GitHub issue and pull request templates (bilingual)
 
 ### Changed
-- `backends-age` now uses the `tempfile` crate instead of a hand-rolled temp
-  directory implementation.
-- `backends-age` compression level is now configurable via `--compression`
-  instead of a hardcoded value.
-- `backends-7z` now clamps the compression level to the valid 0-9 range and
-  surfaces the underlying `7z` process's stderr output on failure.
-- Archive extension for the `age` engine renamed from `sa-age` to `ramz-age`
-  to match the project's final name.
-
-### Known limitations
-- CI/release GitHub Actions workflows are being set up but not yet confirmed
-  present in this snapshot.
-- Only two engines implemented so far; Argon2id key derivation and
-  post-quantum hybrid encryption are planned but not started.
-
-## [0.2.0] - 2026-07-20
-
-### Added
-- `--argon2id` flag added to the CLI (scaffolded)
-- `--mlkem` flag added to the CLI (scaffolded)
-- File-type-aware compression (skips already-compressed files: jpg/mp4/pdf/etc.)
-- `--dry-run` mode for previewing archive size and settings
-- `--resume` flag added to the CLI
-- Property-based tests (proptest) and integration tests
-
-### Known limitations
-- `--argon2id` and `--mlkem` were added to the CLI in this version but were
-  not actually connected to the encryption path yet — see [0.2.1] Fixed.
-- `--resume` only suppressed the "archive exists" check; it did not resume
-  interrupted archives.
-- CI/release GitHub Actions workflows present but not yet confirmed working.
-
-## [0.2.1] - 2026-07-21
+- `Backend` trait now includes `extract()` method
+- `AgeBackend::verify()` delegates to `decrypt_archive_to_tar()` with `None` identity
+- Archive format bumped to v1.1 with `FLAG_RECIPIENT` support
+- `SevenZBackend` updated to implement `extract()` trait method
+- CLI package renamed from `ramz` to `ramz-cli` for consistency with the other workspace crates (`ramz-core`, `ramz-backends-age`, `ramz-backend-7z`); the binary itself is still named `ramz`, so `ramz pack ...` is unaffected
+- Identity secret-key files without a password now store the decapsulation key directly (with `chmod 600`) instead of "encrypting" it with a random key stored in the same file — the old approach provided zero protection beyond plaintext while adding complexity and the illusion of security
+- `--secure-delete` on a directory source now recursively overwrites every file inside it, not just the top-level entry
+- Integration tests moved into a dedicated `integration-tests` workspace member so `cargo test --workspace` actually discovers and runs them (they previously lived at the repo root, outside any crate, and were silently never executed)
 
 ### Fixed
-- Updated `ml-kem` dependency usage to match the 0.3.2 API (upstream
-  breaking change: `Kem::generate_keypair()`/`encapsulate()` replace the
-  old `_from_rng` variants; requires the `getrandom` feature).
-- Fixed an invalid Argon2 test salt (was below the 8-byte minimum).
-- Fixed a `ramz-backend-7z` crate name mismatch that broke the build.
-- Fixed `SevenZBackend` usage (it is a unit struct with no `new()`).
-- Implemented the missing `SevenZBackend::extract` method.
-- Fixed the `age` backend's `extract` path, which was missing a zstd
-  decompression step and silently produced corrupted output.
-- **`--argon2id` and `--mlkem` are now actually wired into the encryption
-  path.** Previously these flags were accepted but silently ignored — the
-  archive was always encrypted with age's plain default KDF regardless of
-  the flags. See Security below and the README's "Security design"
-  section for exactly what each flag does now.
-- **`--resume` is now actually wired.** Checks the source checksum,
-  verifies archive state, and either skips a completed archive or reports
-  a clear mismatch error — instead of only suppressing the "archive
-  exists" check.
-- New `IncompatibleFlag` error variant: `--argon2id`/`--mlkem` combined
-  with `--backend seven-z` now produce a clear error instead of a silent
-  no-op.
-- Fixed cross-compilation failures for the `x86_64-unknown-linux-musl`
-  and `aarch64-linux-android` release targets (`zstd-sys` couldn't find
-  a suitable C cross-compiler; CI now installs `musl-tools` and points
-  `cc-rs` at the Android NDK's clang).
-- Removed unused-import compiler warnings across `cli` and `core`.
-
-### Added
-- `--secure-delete` flag: overwrites file content before removing the
-  source (best-effort — not a guarantee on SSDs with wear-leveling; this
-  limitation is documented, not glossed over).
-- `docs/ARCHIVE_FORMAT.md`: full byte-level specification of the `RMZ1`
-  custom container format.
-- `--argon2-memory-kib`, `--argon2-iterations`, `--argon2-parallelism`
-  flags for configurable Argon2 parameters (backward-compatible
-  defaults). Parameters are stored in the `RMZ1` container header so
-  archives remain decryptable even if defaults change later.
+- `SevenZBackend` no longer uses non-existent `new()` constructor
+- CLI `Verify` subcommand now supports `--identity` for recipient archives
+- CLI `Extract` subcommand properly routes to `AgeBackend::extract_to_dir()` for recipient archives
+- `ml-kem` workspace dependency was pinned to the incompatible `0.2` line (missing the `getrandom` feature); restored to `0.3` with `getrandom`
+- `argon2` workspace dependency was missing the `password-hash` feature required by `argon2::password_hash::SaltString`/`PasswordHasher`
+- CLI leaked identity password memory via `String::leak()` in `Verify` and `Extract` (contradicting the zeroization work elsewhere in the codebase); now kept in a normally-scoped variable
+- The `--resume` completion check regressed to only comparing the source checksum, without confirming `processed_bytes == total_bytes` or that the archive file exists — reintroducing the false-completion bug fixed in 0.2.2; restored the full three-way check (mismatch / complete / incomplete-so-redo)
+- `release.yml` had been simplified to only upload build artifacts, without creating an actual GitHub Release or extracting notes from `CHANGELOG.md`; restored release creation, and re-added the `musl-tools` and Android NDK compiler configuration needed for the `x86_64-unknown-linux-musl` and `aarch64-linux-android` cross-builds
+- `ci.yml` didn't install a `7z` binary, so any test exercising the 7z backend would fail on CI
+- `mlkem_hybrid.rs` had reverted to referencing a nonexistent `ml-kem` API (`KemCore`, `Encoded`, `EncodedSizeUser`, `MlKem768Params`, `.generate()`) that doesn't exist in any published version of the crate; restored to the verified 0.3.2 API (`Kem::generate_keypair()`, `Encapsulate::encapsulate()`, `Decapsulate::decapsulate()`)
+- `ramz verify --identity` always prompted for a generic password first, even for identity-based archives, before separately prompting for the identity password — a confusing double-prompt; now only prompts for the identity password when `--identity` is used
+- `ramz extract` without `-p`/`--identity` passed `None` straight to the backend instead of prompting interactively like `pack` and `verify` do, so it just errored out instead of giving the user a chance to type a password
+- `Cargo.lock` was listed in `.gitignore`; for a binary/application project (not a library), it should be committed for reproducible builds
+- A stray, outdated single-license `LICENSE` file was left behind alongside the new `LICENSE-MIT`/`LICENSE-APACHE` split from a prior merge; removed
+- `docs/IDENTITY_FORMAT.md` still described the old (removed) "storage key embedded in file" no-password layout; updated to match the current format (protection-flag byte, direct key storage)
+- Restored real end-to-end pack/verify/extract integration tests for the `7z` backend, which had been reduced to a single metadata-only test during a rewrite, leaving the entire 7z encryption path without coverage
 
 ### Security
-- `--argon2id`: password-based key derivation now genuinely uses
-  memory-hard Argon2id (64 MiB, 3 iterations, parallelism 4 by default)
-  instead of silently falling back to age's default scrypt-based KDF.
-- `--mlkem`: introduces a custom archive container (`RMZ1` magic bytes)
-  that combines the Argon2id-derived key with a per-archive ML-KEM-768
-  shared secret via SHA-256, as hybrid hardening. This is defense-in-depth,
-  not a substitute for password strength — see the README for the exact
-  threat model.
-- The final encryption key is now wrapped in `Zeroizing<[u8; 32]>`, and
-  `MlKemKeyPair` implements manual `Zeroize`/`ZeroizeOnDrop`, clearing
-  sensitive key material from memory when it goes out of scope
-  (defense-in-depth against cold-boot and memory-dump attacks).
-- Added 11 new tests covering wrong-password rejection, backend/flag
-  incompatibility, and full pack→verify→extract round-trips for
-  `--argon2id`, `--mlkem`, and `--secure-delete`.
+- Recipient-based encryption (`--recipient`) is a genuinely different security model from `--mlkem`: the decapsulation key never enters the archive, so possessing the archive plus a correct guess of any password provides no path to the plaintext — only physical possession of the recipient's identity file does. See the README's "Security design" section for the full threat-model comparison with `--mlkem`.
+- Identity secret-key files are protected by filesystem permissions (`chmod 600`) at minimum, and additionally by Argon2id + ChaCha20-Poly1305 encryption when a password is supplied at `ramz keygen` time.
 
 ### Known limitations
-- `--argon2id`/`--mlkem` apply only to the `age` backend.
-- No independent security review has been performed on the `RMZ1`
-  container format.
-- ML-KEM hybrid hardening (`--mlkem`) does not protect against password
-  compromise — see the README's "Security design" section for the exact
-  threat model. A true recipient-key post-quantum workflow is planned
-  (tracked in ROADMAP.md).
+- No independent security review has been performed on the `RMZ1` archive format or the `RIM1` identity format.
+- Recipient archives currently support exactly one recipient; multi-recipient support (like `age -r key1 -r key2`) is not implemented.
+- The encryption pipeline is not streaming — very large files are held in memory/temp files during pack, which may be slow or memory-intensive on constrained devices.
+- Secure delete is best-effort and provides no guarantee on SSDs/flash storage with wear-leveling; see the in-code documentation on `secure_delete_file()`.
+
+## [0.2.1] - 2026-07-20
+
+### Added
+- `--argon2id` flag: Argon2id-based key derivation with tunable parameters
+- `--mlkem` flag: Post-quantum ML-KEM-768 hybrid encryption
+- `--resume` flag: Resume interrupted archive creation
+- `--dry-run` flag: Preview archive without creating it
+- `--secure-delete` flag: Overwrite source before deletion
+- `docs/ARCHIVE_FORMAT.md`: Specification for RMZ1 archive format
+- `CHANGELOG.md`: Project changelog
+- CI workflow for automated testing
+- Release workflow with cross-compilation for 7 targets
+
+### Fixed
+- Resume falsely reported completed archives that were never created
+- README accidentally committed with stale content
+
+## [0.2.0] - 2026-07-18
+
+### Added
+- `age` backend with passphrase encryption
+- `7z` backend with external binary integration
+- `ramz_core` crate with shared types and utilities
+- Progress reporting with indicatif
+- Password confirmation and validation
+
+## [0.1.0] - 2026-07-15
+
+### Added
+- Initial project scaffold
+- Basic tar + zstd + age encryption pipeline

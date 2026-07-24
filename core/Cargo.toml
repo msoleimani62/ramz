@@ -1,19 +1,20 @@
 [package]
 name = "ramz-core"
 version.workspace = true
+authors.workspace = true
 edition.workspace = true
 license.workspace = true
+rust-version.workspace = true
 
 [dependencies]
-anyhow.workspace = true
-thiserror.workspace = true
-walkdir.workspace = true
-tar = "0.4"
-serde = { version = "1", features = ["derive"] }
-serde_json = "1"
-sha2 = "0.10"
-rand = "0.8"
+thiserror = { workspace = true }
+walkdir = { workspace = true }
+tar = { workspace = true }
+zstd = { workspace = true }
+tempfile = { workspace = true }
+sha2 = { workspace = true }
+zeroize = { workspace = true }
+rand = { workspace = true }
 
 [dev-dependencies]
-tempfile = "3"
-proptest = "1"
+tempfile = { workspace = true }

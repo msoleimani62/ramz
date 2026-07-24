@@ -13,6 +13,8 @@ pub use resume::*;
 pub mod secure_delete;
 pub use secure_delete::*;
 
+// Error types for the ramz-core crate
+// انواع خطا برای crate ramz-core
 #[derive(Error, Debug)]
 pub enum RamzError {
     #[error("path not found: {0}")]
@@ -54,12 +56,16 @@ pub enum RamzError {
 
 pub type Result<T> = std::result::Result<T, RamzError>;
 
+// Type of source being archived
+// نوع منبع در حال آرشیو شدن
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum SourceKind {
     File,
     Directory,
 }
 
+// Represents a target file or directory for archiving
+// نمایش یک فایل یا پوشه هدف برای آرشیو کردن
 #[derive(Debug, Clone)]
 pub struct Target {
     pub path: PathBuf,
@@ -96,6 +102,8 @@ impl Target {
     }
 }
 
+// Calculate total size of a file or directory recursively
+// محاسبه حجم کل یک فایل یا پوشه به صورت بازگشتی
 pub fn dir_size(path: &Path) -> Result<u64> {
     let mut total = 0u64;
     if path.is_file() {
@@ -113,12 +121,16 @@ pub fn dir_size(path: &Path) -> Result<u64> {
     Ok(total)
 }
 
+// Trait for reporting progress during pack/extract operations
+// تریت برای گزارش پیشرفت در عملیات pack/extract
 pub trait ProgressReporter: Send {
     fn set_total(&mut self, total_bytes: u64);
     fn on_progress(&mut self, processed_bytes: u64);
     fn finish(&mut self, message: &str);
 }
 
+// No-op progress reporter for testing
+// گزارش‌گر پیشرفت خالی برای تست
 pub struct NullProgress;
 impl ProgressReporter for NullProgress {
     fn set_total(&mut self, _total_bytes: u64) {}
@@ -126,6 +138,8 @@ impl ProgressReporter for NullProgress {
     fn finish(&mut self, _message: &str) {}
 }
 
+// Options for packing an archive
+// گزینه‌های بسته‌بندی یک آرشیو
 #[derive(Debug, Clone)]
 pub struct PackOptions {
     pub password: Option<String>,
@@ -155,6 +169,8 @@ impl Default for PackOptions {
     }
 }
 
+// Shared backend interface for all compression/encryption engines
+// رابط مشترک backend برای همه موتورهای فشرده‌سازی/رمزنگاری
 pub trait Backend {
     fn name(&self) -> &'static str;
     fn extension(&self) -> &'static str;
@@ -169,8 +185,13 @@ pub trait Backend {
     ) -> Result<()>;
 
     fn verify(&self, archive_path: &Path, password: Option<&str>) -> Result<()>;
+
+    fn extract(&self, archive_path: &Path, output_dir: &Path, password: Option<&str>)
+        -> Result<()>;
 }
 
+// Pack a target into a tar archive
+// بسته‌بندی یک هدف در آرشیو tar
 pub fn pack_to_tar<W: Write>(target: &Target, writer: W) -> Result<()> {
     let mut builder = tar::Builder::new(writer);
     match target.kind {
@@ -194,12 +215,16 @@ pub fn pack_to_tar<W: Write>(target: &Target, writer: W) -> Result<()> {
     Ok(())
 }
 
+// Unpack a tar archive to a destination directory
+// باز کردن آرشیو tar در پوشه مقصد
 pub fn unpack_from_tar<R: Read>(reader: R, dest: &Path) -> Result<()> {
     let mut archive = tar::Archive::new(reader);
     archive.unpack(dest)?;
     Ok(())
 }
 
+// Read and confirm a password from two prompts
+// خواندن و تایید یک پسورد از دو پرامپت
 pub fn read_and_confirm_password(
     read1: impl FnOnce() -> std::io::Result<String>,
     read2: impl FnOnce() -> std::io::Result<String>,
@@ -215,6 +240,8 @@ pub fn read_and_confirm_password(
     Ok(p1)
 }
 
+// Determine safe output directory for an archive
+// تعیین پوشه خروجی امن برای آرشیو
 pub fn safe_output_dir(path: &Path, explicit_output: Option<&Path>) -> PathBuf {
     if let Some(out) = explicit_output {
         return out.to_path_buf();

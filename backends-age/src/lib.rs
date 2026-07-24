@@ -9,27 +9,21 @@ use rand::{rngs::OsRng, RngCore};
 use zeroize::Zeroizing;
 
 pub mod argon2_kdf;
+pub mod identity;
 pub mod mlkem_hybrid;
 
-// binary magic bytes identifying the custom archive container (Argon2id / ML-KEM hybrid)
-// شناسه‌ی باینری فرمت آرشیو سفارشی (Argon2id / ML-KEM hybrid)
+// Binary magic bytes identifying the custom archive container
+// بایت‌های جادویی شناسایی کانتینر آرشیو سفارشی
 const RAMZ_MAGIC: &[u8; 4] = b"RMZ1";
 const FLAG_ARGON2ID: u8 = 0b01;
 const FLAG_MLKEM: u8 = 0b10;
-
-// header layout (v1):
-// [0..4]   magic: "RMZ1"
-// [4]      flags: bitfield (FLAG_ARGON2ID | FLAG_MLKEM)
-// [5..9]   argon2_memory_kib: u32 LE
-// [9..13]  argon2_iterations: u32 LE
-// [13..17] argon2_parallelism: u32 LE
-// [17..33] salt: 16 bytes
-// then ML-KEM fields if FLAG_MLKEM set
-// then payload_nonce (12 bytes) + ciphertext
+const FLAG_RECIPIENT: u8 = 0b100;
 
 pub struct AgeBackend {
     use_argon2id: bool,
     use_mlkem: bool,
+    use_recipient: bool,
+    recipient_key: Option<Vec<u8>>,
 }
 
 impl Default for AgeBackend {
@@ -43,6 +37,8 @@ impl AgeBackend {
         Self {
             use_argon2id: false,
             use_mlkem: false,
+            use_recipient: false,
+            recipient_key: None,
         }
     }
 
@@ -50,6 +46,8 @@ impl AgeBackend {
         Self {
             use_argon2id: true,
             use_mlkem: false,
+            use_recipient: false,
+            recipient_key: None,
         }
     }
 
@@ -57,9 +55,22 @@ impl AgeBackend {
         Self {
             use_argon2id: false,
             use_mlkem: true,
+            use_recipient: false,
+            recipient_key: None,
         }
     }
 
+    pub fn new_with_recipient(recipient_pub_key: Vec<u8>) -> Self {
+        Self {
+            use_argon2id: false,
+            use_mlkem: false,
+            use_recipient: true,
+            recipient_key: Some(recipient_pub_key),
+        }
+    }
+
+    // Decrypt standard age format to writer
+    // رمزگشایی فرمت استاندارد age به writer
     pub fn decrypt_to_writer<R: Read, W: Write>(
         &self,
         reader: &mut R,
@@ -96,29 +107,14 @@ impl AgeBackend {
         Ok(())
     }
 
-    // encrypts the compressed payload into the custom container when Argon2id or ML-KEM is enabled
-    // رمزنگاری داده‌ی فشرده‌شده در قالب سفارشی وقتی Argon2id یا ML-KEM فعال باشه
+    // Encrypt compressed payload into custom container
+    // رمزنگاری payload فشرده در کانتینر سفارشی
     fn pack_custom_container(
         &self,
         compressed: &[u8],
         archive_path: &Path,
         opts: &PackOptions,
     ) -> Result<()> {
-        let password = opts
-            .password
-            .as_deref()
-            .ok_or_else(|| RamzError::Backend("age requires a password".into()))?;
-
-        let salt = argon2_kdf::generate_salt();
-        let argon2_key = argon2_kdf::derive_key(
-            password,
-            &salt,
-            opts.argon2_memory_kib,
-            opts.argon2_iterations,
-            opts.argon2_parallelism,
-        )
-        .map_err(RamzError::Backend)?;
-
         let mut header: Vec<u8> = Vec::new();
         header.extend_from_slice(RAMZ_MAGIC);
 
@@ -126,26 +122,54 @@ impl AgeBackend {
         if self.use_mlkem {
             flags |= FLAG_MLKEM;
         }
+        if self.use_recipient {
+            flags |= FLAG_RECIPIENT;
+        }
         header.push(flags);
 
-        // store Argon2 params in header for backward compatibility
-        // ذخیره‌ی پارامترهای Argon2 در هدر برای سازگاری به‌عقب
         header.extend_from_slice(&opts.argon2_memory_kib.to_le_bytes());
         header.extend_from_slice(&opts.argon2_iterations.to_le_bytes());
         header.extend_from_slice(&opts.argon2_parallelism.to_le_bytes());
 
+        let salt = argon2_kdf::generate_salt();
         header.extend_from_slice(&salt);
 
         let mut final_key = Zeroizing::new([0u8; 32]);
-        if self.use_mlkem {
-            let keypair = mlkem_hybrid::generate_keypair();
-            let (mlkem_ct, mlkem_shared) =
-                mlkem_hybrid::encapsulate(&keypair.public_key).map_err(RamzError::Backend)?;
 
-            // wrap the ML-KEM secret key using the Argon2id-derived key
-            // رمزنگاری کلید خصوصی ML-KEM با کلید مشتق‌شده از Argon2id
+        if self.use_recipient {
+            let recipient_ek = self
+                .recipient_key
+                .as_ref()
+                .ok_or_else(|| RamzError::Backend("recipient key not provided".into()))?;
+
+            let (mlkem_ct, mlkem_shared) = mlkem_hybrid::encapsulate(recipient_ek)
+                .map_err(|e| RamzError::Backend(format!("mlkem encapsulate: {}", e)))?;
+
+            header.extend_from_slice(&(mlkem_ct.len() as u32).to_le_bytes());
+            header.extend_from_slice(&mlkem_ct);
+
+            final_key.copy_from_slice(&mlkem_shared);
+        } else if self.use_mlkem {
+            let password = opts
+                .password
+                .as_deref()
+                .ok_or_else(|| RamzError::Backend("age requires a password".into()))?;
+
+            let argon2_key = argon2_kdf::derive_key(
+                password,
+                &salt,
+                opts.argon2_memory_kib,
+                opts.argon2_iterations,
+                opts.argon2_parallelism,
+            )
+            .map_err(|e| RamzError::Backend(format!("argon2 derive: {}", e)))?;
+
+            let keypair = mlkem_hybrid::generate_keypair();
+            let (mlkem_ct, mlkem_shared) = mlkem_hybrid::encapsulate(&keypair.public_key)
+                .map_err(|e| RamzError::Backend(format!("mlkem encapsulate: {}", e)))?;
+
             let dk_nonce = generate_nonce();
-            let wrap_cipher = ChaCha20Poly1305::new(Key::from_slice(argon2_key.as_ref()));
+            let wrap_cipher = ChaCha20Poly1305::new(Key::from_slice(argon2_key.as_slice()));
             let dk_encrypted = wrap_cipher
                 .encrypt(Nonce::from_slice(&dk_nonce), keypair.secret_key.as_slice())
                 .map_err(|e| RamzError::Backend(format!("mlkem key wrap: {}", e)))?;
@@ -156,14 +180,28 @@ impl AgeBackend {
             header.extend_from_slice(&(dk_encrypted.len() as u32).to_le_bytes());
             header.extend_from_slice(&dk_encrypted);
 
-            let combined = mlkem_hybrid::combine_secrets(argon2_key.as_ref(), &mlkem_shared);
+            let combined = mlkem_hybrid::combine_secrets(argon2_key.as_slice(), &mlkem_shared);
             final_key.copy_from_slice(&combined);
         } else {
-            final_key.copy_from_slice(argon2_key.as_ref());
+            let password = opts
+                .password
+                .as_deref()
+                .ok_or_else(|| RamzError::Backend("age requires a password".into()))?;
+
+            let argon2_key = argon2_kdf::derive_key(
+                password,
+                &salt,
+                opts.argon2_memory_kib,
+                opts.argon2_iterations,
+                opts.argon2_parallelism,
+            )
+            .map_err(|e| RamzError::Backend(format!("argon2 derive: {}", e)))?;
+
+            final_key.copy_from_slice(argon2_key.as_slice());
         }
 
         let payload_nonce = generate_nonce();
-        let cipher = ChaCha20Poly1305::new(Key::from_slice(final_key.as_ref()));
+        let cipher = ChaCha20Poly1305::new(Key::from_slice(final_key.as_slice()));
         let ciphertext = cipher
             .encrypt(Nonce::from_slice(&payload_nonce), compressed)
             .map_err(|e| RamzError::Backend(format!("payload encrypt: {}", e)))?;
@@ -175,19 +213,20 @@ impl AgeBackend {
         Ok(())
     }
 
-    // decrypts either archive format (standard age or the custom container) down to the raw tar bytes
-    // بازکردن آرشیو (هر دو فرمت: age استاندارد و کانتینر سفارشی) تا bytes تار فشرده‌نشده
+    // Decrypt archive to raw tar bytes, supporting all formats
+    // رمزگشایی آرشیو به بایت‌های خام tar، پشتیبانی از همه فرمت‌ها
     fn decrypt_archive_to_tar(
         &self,
         archive_path: &Path,
         password: Option<&str>,
+        identity: Option<&identity::Identity>,
     ) -> Result<Vec<u8>> {
         let mut file = fs::File::open(archive_path)?;
         let mut raw = Vec::new();
         file.read_to_end(&mut raw).map_err(RamzError::Io)?;
 
         if raw.starts_with(RAMZ_MAGIC) {
-            self.decrypt_custom_container(&raw, password)
+            self.decrypt_custom_container(&raw, password, identity)
         } else {
             let mut decrypted = Vec::new();
             self.decrypt_to_writer(&mut &raw[..], &mut decrypted, password)?;
@@ -195,18 +234,20 @@ impl AgeBackend {
         }
     }
 
-    fn decrypt_custom_container(&self, raw: &[u8], password: Option<&str>) -> Result<Vec<u8>> {
-        let password =
-            password.ok_or_else(|| RamzError::Backend("age requires a password".into()))?;
-
+    // Decrypt custom RMZ1 container format
+    // رمزگشایی فرمت کانتینر سفارشی RMZ1
+    fn decrypt_custom_container(
+        &self,
+        raw: &[u8],
+        password: Option<&str>,
+        identity: Option<&identity::Identity>,
+    ) -> Result<Vec<u8>> {
         let mut pos = RAMZ_MAGIC.len();
         let flags = *raw
             .get(pos)
             .ok_or_else(|| RamzError::Backend("truncated archive header".into()))?;
         pos += 1;
 
-        // read Argon2 params from header (backward compatibility)
-        // خواندن پارامترهای Argon2 از هدر (سازگاری به‌عقب)
         let memory_kib = read_u32(raw, &mut pos)?;
         let iterations = read_u32(raw, &mut pos)?;
         let parallelism = read_u32(raw, &mut pos)?;
@@ -216,12 +257,32 @@ impl AgeBackend {
             .ok_or_else(|| RamzError::Backend("truncated archive header".into()))?;
         pos += 16;
 
-        let argon2_key =
-            argon2_kdf::derive_key(password, salt, memory_kib, iterations, parallelism)
-                .map_err(RamzError::Backend)?;
-
         let mut final_key = Zeroizing::new([0u8; 32]);
-        if flags & FLAG_MLKEM != 0 {
+
+        if flags & FLAG_RECIPIENT != 0 {
+            let identity = identity.ok_or_else(|| {
+                RamzError::Backend("recipient archive requires --identity to decrypt".into())
+            })?;
+
+            let ct_len = read_u32(raw, &mut pos)?;
+            let mlkem_ct = raw
+                .get(pos..pos + ct_len as usize)
+                .ok_or_else(|| RamzError::Backend("truncated archive header".into()))?;
+            pos += ct_len as usize;
+
+            let mlkem_shared =
+                mlkem_hybrid::decapsulate(identity.decapsulation_key.as_slice(), mlkem_ct)
+                    .map_err(|e| RamzError::Backend(format!("mlkem decapsulate: {}", e)))?;
+
+            final_key.copy_from_slice(&mlkem_shared);
+        } else if flags & FLAG_MLKEM != 0 {
+            let password =
+                password.ok_or_else(|| RamzError::Backend("age requires a password".into()))?;
+
+            let argon2_key =
+                argon2_kdf::derive_key(password, salt, memory_kib, iterations, parallelism)
+                    .map_err(|e| RamzError::Backend(format!("argon2 derive: {}", e)))?;
+
             let ct_len = read_u32(raw, &mut pos)?;
             let mlkem_ct = raw
                 .get(pos..pos + ct_len as usize)
@@ -239,18 +300,25 @@ impl AgeBackend {
                 .ok_or_else(|| RamzError::Backend("truncated archive header".into()))?;
             pos += dk_enc_len as usize;
 
-            let wrap_cipher = ChaCha20Poly1305::new(Key::from_slice(argon2_key.as_ref()));
+            let wrap_cipher = ChaCha20Poly1305::new(Key::from_slice(argon2_key.as_slice()));
             let dk_bytes = wrap_cipher
                 .decrypt(Nonce::from_slice(dk_nonce), dk_encrypted)
                 .map_err(|_| RamzError::Backend("wrong password or corrupted archive".into()))?;
 
-            let mlkem_shared =
-                mlkem_hybrid::decapsulate(&dk_bytes, mlkem_ct).map_err(RamzError::Backend)?;
+            let mlkem_shared = mlkem_hybrid::decapsulate(&dk_bytes, mlkem_ct)
+                .map_err(|e| RamzError::Backend(format!("mlkem decapsulate: {}", e)))?;
 
-            let combined = mlkem_hybrid::combine_secrets(argon2_key.as_ref(), &mlkem_shared);
+            let combined = mlkem_hybrid::combine_secrets(argon2_key.as_slice(), &mlkem_shared);
             final_key.copy_from_slice(&combined);
         } else {
-            final_key.copy_from_slice(argon2_key.as_ref());
+            let password =
+                password.ok_or_else(|| RamzError::Backend("age requires a password".into()))?;
+
+            let argon2_key =
+                argon2_kdf::derive_key(password, salt, memory_kib, iterations, parallelism)
+                    .map_err(|e| RamzError::Backend(format!("argon2 derive: {}", e)))?;
+
+            final_key.copy_from_slice(argon2_key.as_slice());
         }
 
         let payload_nonce = raw
@@ -260,7 +328,7 @@ impl AgeBackend {
 
         let ciphertext = &raw[pos..];
 
-        let cipher = ChaCha20Poly1305::new(Key::from_slice(final_key.as_ref()));
+        let cipher = ChaCha20Poly1305::new(Key::from_slice(final_key.as_slice()));
         let compressed = cipher
             .decrypt(Nonce::from_slice(payload_nonce), ciphertext)
             .map_err(|_| RamzError::Backend("wrong password or corrupted archive".into()))?;
@@ -268,14 +336,37 @@ impl AgeBackend {
         decompress_zstd(&compressed)
     }
 
+    // Extract archive to directory, with optional identity for recipient archives
+    // استخراج آرشیو به پوشه، با identity اختیاری برای آرشیوهای recipient
     pub fn extract_to_dir(
         &self,
         archive_path: &Path,
         output_dir: &Path,
         password: Option<&str>,
+        identity: Option<&identity::Identity>,
     ) -> Result<()> {
-        let decompressed = self.decrypt_archive_to_tar(archive_path, password)?;
+        let decompressed = self.decrypt_archive_to_tar(archive_path, password, identity)?;
         ramz_core::unpack_from_tar(&decompressed[..], output_dir)
+    }
+
+    // Verify archive integrity with optional identity
+    // بررسی یکپارچگی آرشیو با identity اختیاری
+    pub fn verify_with_identity(
+        &self,
+        archive_path: &Path,
+        identity: &identity::Identity,
+    ) -> Result<()> {
+        let decompressed = self.decrypt_archive_to_tar(archive_path, None, Some(identity))?;
+
+        let mut tar = tar::Archive::new(&decompressed[..]);
+        for entry in tar
+            .entries()
+            .map_err(|e| RamzError::Backend(e.to_string()))?
+        {
+            let _ = entry.map_err(|e| RamzError::Backend(e.to_string()))?;
+        }
+
+        Ok(())
     }
 }
 
@@ -381,7 +472,7 @@ impl Backend for AgeBackend {
             .finish()
             .map_err(|e| RamzError::Backend(format!("zstd finish: {}", e)))?;
 
-        if self.use_argon2id || self.use_mlkem {
+        if self.use_argon2id || self.use_mlkem || self.use_recipient {
             self.pack_custom_container(&compressed, archive_path, opts)?;
         } else {
             let encryptor = if let Some(ref pw) = opts.password {
@@ -408,7 +499,7 @@ impl Backend for AgeBackend {
     }
 
     fn verify(&self, archive_path: &Path, password: Option<&str>) -> Result<()> {
-        let decompressed = self.decrypt_archive_to_tar(archive_path, password)?;
+        let decompressed = self.decrypt_archive_to_tar(archive_path, password, None)?;
 
         let mut tar = tar::Archive::new(&decompressed[..]);
         for entry in tar
@@ -419,6 +510,15 @@ impl Backend for AgeBackend {
         }
 
         Ok(())
+    }
+
+    fn extract(
+        &self,
+        archive_path: &Path,
+        output_dir: &Path,
+        password: Option<&str>,
+    ) -> Result<()> {
+        self.extract_to_dir(archive_path, output_dir, password, None)
     }
 }
 
@@ -559,7 +659,7 @@ mod tests {
 
         let extract_dir = tmp.path().join("extracted_argon2");
         backend
-            .extract_to_dir(&archive, &extract_dir, Some("argon2-password"))
+            .extract_to_dir(&archive, &extract_dir, Some("argon2-password"), None)
             .unwrap();
         let extracted = fs::read(extract_dir.join("argon2.txt")).unwrap();
         assert_eq!(extracted, b"argon2id test");
@@ -627,7 +727,7 @@ mod tests {
 
         let extract_dir = tmp.path().join("extracted_mlkem");
         backend
-            .extract_to_dir(&archive, &extract_dir, Some("mlkem-password"))
+            .extract_to_dir(&archive, &extract_dir, Some("mlkem-password"), None)
             .unwrap();
         let extracted = fs::read(extract_dir.join("mlkem.txt")).unwrap();
         assert_eq!(extracted, b"ml-kem test");
@@ -692,5 +792,103 @@ mod tests {
         assert!(archive.exists());
 
         backend.verify(&archive, Some("custom-password")).unwrap();
+    }
+
+    #[test]
+    fn test_age_backend_recipient_roundtrip() {
+        let tmp = TempDir::new().unwrap();
+        let file = tmp.path().join("recipient.txt");
+        let mut f = fs::File::create(&file).unwrap();
+        f.write_all(b"recipient-only encryption").unwrap();
+        let archive = tmp.path().join("recipient.age.tar.zst");
+
+        let identity = identity::Identity::generate();
+        let target = Target::detect(&file).unwrap();
+        let backend = AgeBackend::new_with_recipient(identity.encapsulation_key.clone());
+        let opts = PackOptions {
+            password: None,
+            compression_level: 3,
+            delete_source: false,
+            output_dir: Some(tmp.path().to_path_buf()),
+            force_overwrite: true,
+            argon2_memory_kib: 65536,
+            argon2_iterations: 3,
+            argon2_parallelism: 4,
+            secure_delete: false,
+        };
+
+        let mut progress = NullProgress;
+        backend
+            .pack(&target, &archive, &opts, &mut progress)
+            .unwrap();
+        assert!(archive.exists());
+
+        let extract_dir = tmp.path().join("extracted_recipient");
+        backend
+            .extract_to_dir(&archive, &extract_dir, None, Some(&identity))
+            .unwrap();
+        let extracted = fs::read(extract_dir.join("recipient.txt")).unwrap();
+        assert_eq!(extracted, b"recipient-only encryption");
+    }
+
+    #[test]
+    fn test_age_backend_recipient_verify_with_identity() {
+        let tmp = TempDir::new().unwrap();
+        let file = tmp.path().join("recipient.txt");
+        fs::File::create(&file).unwrap();
+        let archive = tmp.path().join("recipient.age.tar.zst");
+
+        let identity = identity::Identity::generate();
+        let target = Target::detect(&file).unwrap();
+        let backend = AgeBackend::new_with_recipient(identity.encapsulation_key.clone());
+        let opts = PackOptions {
+            password: None,
+            compression_level: 3,
+            delete_source: false,
+            output_dir: Some(tmp.path().to_path_buf()),
+            force_overwrite: true,
+            argon2_memory_kib: 65536,
+            argon2_iterations: 3,
+            argon2_parallelism: 4,
+            secure_delete: false,
+        };
+
+        let mut progress = NullProgress;
+        backend
+            .pack(&target, &archive, &opts, &mut progress)
+            .unwrap();
+
+        backend.verify_with_identity(&archive, &identity).unwrap();
+    }
+
+    #[test]
+    fn test_age_backend_recipient_without_identity_fails() {
+        let tmp = TempDir::new().unwrap();
+        let file = tmp.path().join("recipient.txt");
+        fs::File::create(&file).unwrap();
+        let archive = tmp.path().join("recipient.age.tar.zst");
+
+        let identity = identity::Identity::generate();
+        let target = Target::detect(&file).unwrap();
+        let backend = AgeBackend::new_with_recipient(identity.encapsulation_key.clone());
+        let opts = PackOptions {
+            password: None,
+            compression_level: 3,
+            delete_source: false,
+            output_dir: Some(tmp.path().to_path_buf()),
+            force_overwrite: true,
+            argon2_memory_kib: 65536,
+            argon2_iterations: 3,
+            argon2_parallelism: 4,
+            secure_delete: false,
+        };
+
+        let mut progress = NullProgress;
+        backend
+            .pack(&target, &archive, &opts, &mut progress)
+            .unwrap();
+
+        let result = backend.verify(&archive, None);
+        assert!(result.is_err());
     }
 }

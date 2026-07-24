@@ -1,21 +1,24 @@
 [package]
 name = "ramz-backends-age"
 version.workspace = true
+authors.workspace = true
 edition.workspace = true
 license.workspace = true
+rust-version.workspace = true
 
 [dependencies]
-ramz-core = { path = "../core" }
-age = { version = "0.10", features = ["armor"] }
-zstd = "0.13"
-tempfile = "3"
-argon2 = { version = "0.5", features = ["password-hash"] }
-rand = "0.8"
-ml-kem = { version = "0.3", features = ["getrandom"] }
-sha2.workspace = true
-chacha20poly1305 = "0.10"
-tar = "0.4"
-zeroize = { version = "1", features = ["derive", "alloc"] }
+ramz-core = { workspace = true }
+age = { workspace = true }
+chacha20poly1305 = { workspace = true }
+argon2 = { workspace = true }
+rand = { workspace = true }
+zeroize = { workspace = true }
+tempfile = { workspace = true }
+zstd = { workspace = true }
+tar = { workspace = true }
+sha2 = { workspace = true }
+ml-kem = { workspace = true }
 
 [dev-dependencies]
-proptest.workspace = true
+tempfile = { workspace = true }
+proptest = "1"

@@ -109,7 +109,7 @@ jobs:
         uses: Swatinem/rust-cache@v2
 
       - name: Build release binary
-        run: cargo build --release --target ${{ matrix.target }} --package ramz
+        run: cargo build --release --target ${{ matrix.target }} --manifest-path cli/Cargo.toml
         env:
           CARGO_TARGET_AARCH64_UNKNOWN_LINUX_GNU_LINKER: aarch64-linux-gnu-gcc
           CC_x86_64_unknown_linux_musl: musl-gcc

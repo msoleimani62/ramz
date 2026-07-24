@@ -2,124 +2,93 @@
 
 ## Overview
 
-RMZ1 is the custom binary container format used by `ramz` when Argon2id
-and/or ML-KEM post-quantum hybrid encryption is enabled with the age backend.
-When neither flag is set, the standard age passphrase format is used instead.
+RMZ1 is the custom binary container format used by `ramz` when `--argon2id`, `--mlkem`, or `--recipient` flags are enabled. It provides authenticated encryption with ChaCha20-Poly1305 over zstd-compressed tar archives.
 
-> **Version:** 1.0
-> **Magic:** `RMZ1` (0x52 0x4D 0x5A 0x31)
+## Magic Bytes
 
----
+| Offset | Size | Value | Description |
+|--------|------|-------|-------------|
+| 0      | 4    | `RMZ1` | Format identifier |
 
-## Byte-Level Layout
+## Header Layout (v1.1)
 
-All multi-byte integers are **little-endian**.
+| Offset | Size | Type | Field |
+|--------|------|------|-------|
+| 0      | 4    | bytes | Magic: `RMZ1` |
+| 4      | 1    | u8    | Flags bitfield |
+| 5      | 4    | u32 LE | Argon2 memory (KiB) |
+| 9      | 4    | u32 LE | Argon2 iterations |
+| 13     | 4    | u32 LE | Argon2 parallelism |
+| 17     | 16   | bytes | Argon2 salt |
 
-```
-Offset    Size    Field
-─────────────────────────────────────────────────────────────
-0         4       Magic: "RMZ1"
-4         1       Flags (bitfield)
-5         4       Argon2 memory (KiB)
-9         4       Argon2 iterations
-13        4       Argon2 parallelism
-17        16      Salt
-33        *       ML-KEM fields (only if FLAG_MLKEM)
-*         12      Payload nonce (ChaCha20-Poly1305)
-*         *       Ciphertext (ChaCha20-Poly1305)
-```
+### Flags Bitfield
 
----
+| Bit | Flag | Description |
+|-----|------|-------------|
+| 0   | `FLAG_ARGON2ID` (0x01) | Argon2id KDF enabled |
+| 1   | `FLAG_MLKEM` (0x02) | ML-KEM hybrid encryption |
+| 2   | `FLAG_RECIPIENT` (0x04) | Recipient-based encryption |
 
-## Flags Byte
+## Mode-Specific Fields
 
-| Bit | Name          | Meaning                               |
-|-----|---------------|---------------------------------------|
-| 0   | FLAG_ARGON2ID | Always set (0x01). Uses Argon2id KDF. |
-| 1   | FLAG_MLKEM    | ML-KEM-768 hybrid encryption (0x02).  |
+### Argon2id-only mode (flags = 0x01)
 
-```
-flags = FLAG_ARGON2ID | (FLAG_MLKEM if mlkem enabled)
-```
+No additional fields after salt. `final_key = argon2_key`.
 
----
+### ML-KEM hybrid mode (flags = 0x03)
 
-## ML-KEM Fields (present only when FLAG_MLKEM is set)
+| Field | Size | Description |
+|-------|------|-------------|
+| `mlkem_ct_len` | 4 | u32 LE |
+| `mlkem_ct` | `mlkem_ct_len` | ML-KEM ciphertext |
+| `dk_nonce` | 12 | ChaCha20-Poly1305 nonce |
+| `dk_enc_len` | 4 | u32 LE |
+| `dk_encrypted` | `dk_enc_len` | Encrypted decapsulation key |
 
-```
-Offset    Size    Field
-─────────────────────────────────────────────────────────────
-33        4       Ciphertext length (u32 LE)
-37        1088    ML-KEM-768 ciphertext
-1125      12      DK nonce (ChaCha20-Poly1305)
-1137      4       Encrypted DK length (u32 LE)
-1141      *       Encrypted decapsulation key
-```
+`final_key = SHA-256(argon2_key || mlkem_shared_secret)`
 
-The decapsulation key (DK) is encrypted with ChaCha20-Poly1305 using the
-Argon2id-derived key. The shared secret is recovered via ML-KEM decapsulation
-and combined with the Argon2id key via SHA-256 to produce the final 256-bit
-payload encryption key.
+### Recipient mode (flags = 0x05)
 
----
+| Field | Size | Description |
+|-------|------|-------------|
+| `mlkem_ct_len` | 4 | u32 LE |
+| `mlkem_ct` | `mlkem_ct_len` | ML-KEM ciphertext (encapsulated to recipient) |
 
-## Key Derivation Flow
+`final_key = mlkem_shared_secret` (no Argon2 involved)
 
-### Encryption (pack)
+**Important:** No decapsulation key is stored in the archive. Only the recipient's identity file can decrypt.
 
-```
-salt = random(16)
-argon2_key = Argon2id(password, salt, memory, iterations, parallelism)
+**Note on the flags byte:** `FLAG_ARGON2ID` is always set by the current
+implementation, even in pure recipient mode where the Argon2 salt/
+parameters in the header are written but never actually used to derive
+`final_key`. A format implementer should treat `FLAG_RECIPIENT` as
+taking priority over `FLAG_ARGON2ID` when both are set — the recipient
+path in the reference implementation checks `FLAG_RECIPIENT` first and
+never touches the Argon2 fields for key derivation in that case.
 
-if ML-KEM:
-    (ek, dk) = ML-KEM-768.generate_keypair()
-    (ct, ss) = ek.encapsulate()
-    dk_encrypted = ChaCha20-Poly1305(argon2_key, nonce_dk, dk)
-    final_key = SHA-256(argon2_key || ss)
-else:
-    final_key = argon2_key
+## Payload
 
-payload = ChaCha20-Poly1305(final_key, nonce_payload, zstd(tar))
-```
+After mode-specific fields:
 
-### Decryption (extract/verify)
+| Field | Size | Description |
+|-------|------|-------------|
+| `payload_nonce` | 12 | ChaCha20-Poly1305 nonce |
+| `ciphertext` | variable | Encrypted zstd-compressed tar |
 
-```
-argon2_key = Argon2id(password, salt, memory, iterations, parallelism)
+## Decryption Flow
 
-if ML-KEM:
-    dk = ChaCha20-Poly1305_decrypt(argon2_key, nonce_dk, dk_encrypted)
-    ss = ML-KEM-768.decapsulate(dk, ct)
-    final_key = SHA-256(argon2_key || ss)
-else:
-    final_key = argon2_key
-
-tar = zstd_decompress(ChaCha20-Poly1305_decrypt(final_key, nonce_payload, ciphertext))
-```
-
----
+1. Read magic and verify `RMZ1`
+2. Read flags, Argon2 params, salt
+3. If `FLAG_RECIPIENT`: decapsulate with identity's `dk`
+4. If `FLAG_MLKEM`: derive Argon2 key, decrypt `dk`, decapsulate
+5. If Argon2id-only: derive Argon2 key
+6. Decrypt payload with `final_key`
+7. Decompress zstd
+8. Extract tar
 
 ## Security Properties
 
-| Threat Model             | Protection                                      |
-|--------------------------|-------------------------------------------------|
-| Brute-force password     | Argon2id memory-hard KDF                        |
-| Quantum computer (Grover)| ML-KEM-768 post-quantum key encapsulation       |
-| Key material in memory   | Zeroizing wrappers on all sensitive material    |
-| Tampering                | ChaCha20-Poly1305 AEAD authentication           |
-
----
-
-## Backward Compatibility
-
-Argon2 parameters (`memory_kib`, `iterations`, `parallelism`) are stored in
-the header. Archives created with different parameters remain decryptable
-because the decryptor reads these values from the header rather than using
-hardcoded defaults.
-
----
-
-## Future Versions
-
-- **v1.1 (planned):** Recipient-based identity files (no password).
-- **v1.2 (planned):** Chunked streaming with per-chunk authentication.
+- **Confidentiality:** ChaCha20-Poly1305 with 256-bit key
+- **Integrity:** Poly1305 authentication tag (16 bytes appended by AEAD)
+- **Post-quantum (recipient mode):** ML-KEM-768; no password to crack
+- **Post-quantum (hybrid mode):** Argon2id + ML-KEM; password required but quantum-resistant

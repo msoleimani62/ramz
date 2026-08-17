@@ -22,39 +22,58 @@ pub struct ResumeState {
 
 // Compute SHA-256 checksum of a file or directory
 // محاسبه چک‌سام SHA-256 یک فایل یا پوشه
+//
+// BUGFIX: نسخه‌ی قبلی برای پوشه‌ها فقط با fs::read_dir لیست می‌کرد که غیر
+// بازگشتیه - یعنی فایل‌های داخل زیرپوشه‌ها کاملاً نادیده گرفته می‌شدند.
+// نتیجه: تغییر/حذف/اضافه‌شدن فایل در زیرپوشه، چک‌سام رو عوض نمی‌کرد و
+// verify_source_unchanged/resume به اشتباه می‌گفت «سورس تغییر نکرده».
+// الان با walkdir بازگشتی روی کل درخت پیمایش می‌کنیم، مسیر نسبی هر فایل
+// هم قبل از محتواش هش می‌شه تا rename/جابه‌جایی فایل‌ها هم تشخیص داده بشه
+// (نه فقط تغییر محتوا).
+//
+// BUGFIX: the previous version only listed directories with fs::read_dir,
+// which is NOT recursive - files inside subdirectories were silently
+// skipped entirely. Result: changing/adding/removing a file in a
+// subdirectory did not change the checksum, so verify_source_unchanged/
+// resume would incorrectly report "source unchanged". Now we walk the
+// whole tree recursively with walkdir, hashing each file's relative path
+// before its content so renames/moves are also detected (not just
+// content changes).
 pub fn compute_file_checksum(path: &Path) -> Result<String> {
     let mut hasher = Sha256::new();
     if path.is_file() {
-        let mut file = fs::File::open(path)?;
-        let mut buf = [0u8; 8192];
-        loop {
-            let n = file.read(&mut buf)?;
-            if n == 0 {
-                break;
-            }
-            hasher.update(&buf[..n]);
-        }
+        hash_file_into(&mut hasher, path)?;
     } else if path.is_dir() {
-        let mut entries: Vec<_> = fs::read_dir(path)?
+        let mut entries: Vec<_> = walkdir::WalkDir::new(path)
+            .into_iter()
             .filter_map(|e| e.ok())
-            .map(|e| e.path())
+            .filter(|e| e.file_type().is_file())
+            .map(|e| e.path().to_path_buf())
             .collect();
         entries.sort();
         for entry in entries {
-            if entry.is_file() {
-                let mut file = fs::File::open(&entry)?;
-                let mut buf = [0u8; 8192];
-                loop {
-                    let n = file.read(&mut buf)?;
-                    if n == 0 {
-                        break;
-                    }
-                    hasher.update(&buf[..n]);
-                }
-            }
+            let relative = entry.strip_prefix(path).unwrap_or(&entry);
+            hasher.update(relative.to_string_lossy().as_bytes());
+            hasher.update(b"\0");
+            hash_file_into(&mut hasher, &entry)?;
         }
     }
     Ok(format!("{:x}", hasher.finalize()))
+}
+
+// Stream a file's content into an in-progress hasher
+// جریان‌دهی محتوای یک فایل به یک هَشِر در حال محاسبه
+fn hash_file_into(hasher: &mut Sha256, path: &Path) -> Result<()> {
+    let mut file = fs::File::open(path)?;
+    let mut buf = [0u8; 8192];
+    loop {
+        let n = file.read(&mut buf)?;
+        if n == 0 {
+            break;
+        }
+        hasher.update(&buf[..n]);
+    }
+    Ok(())
 }
 
 // Check if an archive has a corresponding resume state
@@ -175,6 +194,40 @@ mod tests {
 
         remove_resume_state(&archive).unwrap();
         assert!(!is_resumable(&archive));
+    }
+
+    // این تست دقیقاً باگی رو بازآفرینی می‌کنه که پیدا و رفع کردیم: چک‌سام
+    // پوشه قبلاً فقط فایل‌های سطح اول رو می‌دید و زیرپوشه‌ها رو کاملاً
+    // نادیده می‌گرفت، پس تغییر فایل داخل یه زیرپوشه چک‌سام رو عوض نمی‌کرد
+    // this test reproduces the exact bug we found and fixed: the directory
+    // checksum used to only see top-level files and completely ignored
+    // subdirectories, so changing a file inside a subdirectory did not
+    // change the checksum
+    #[test]
+    fn test_compute_file_checksum_detects_nested_change() {
+        let tmp = TempDir::new().unwrap();
+        let dir = tmp.path().join("project");
+        let sub = dir.join("sub");
+        fs::create_dir_all(&sub).unwrap();
+        fs::write(dir.join("top.txt"), b"top level").unwrap();
+        fs::write(sub.join("nested.txt"), b"nested content").unwrap();
+
+        let before = compute_file_checksum(&dir).unwrap();
+
+        fs::write(sub.join("nested.txt"), b"nested content CHANGED").unwrap();
+        let after_content_change = compute_file_checksum(&dir).unwrap();
+        assert_ne!(
+            before, after_content_change,
+            "BUG: checksum did not change when a nested subdirectory file changed"
+        );
+
+        fs::write(sub.join("nested.txt"), b"nested content").unwrap();
+        fs::write(sub.join("new_file.txt"), b"brand new").unwrap();
+        let after_new_file = compute_file_checksum(&dir).unwrap();
+        assert_ne!(
+            before, after_new_file,
+            "BUG: checksum did not change when a new file was added to a subdirectory"
+        );
     }
 
     #[test]

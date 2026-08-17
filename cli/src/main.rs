@@ -449,11 +449,24 @@ fn run(cli: Cli) -> anyhow::Result<()> {
                             )
                             .into());
                         }
+                        // BUGFIX: قبلاً اینجا با ایندکس خام pub_raw[a..b] پارس
+                        // می‌شد - یه فایل --recipient خراب/کوتاه‌شده باعث
+                        // panic واقعی برنامه می‌شد. الان با .get() بررسی
+                        // محدوده می‌شه و خطای تمیز برمی‌گرده
+                        // BUGFIX: this used to parse with raw pub_raw[a..b]
+                        // indexing - a corrupted/truncated --recipient file
+                        // caused a real program panic. Now bounds-checked
+                        // with .get() and returns a clean error instead
                         let mut pos = 7usize;
-                        let ek_len =
-                            u32::from_le_bytes(pub_raw[pos..pos + 4].try_into().unwrap()) as usize;
+                        let ek_len_bytes = pub_raw
+                            .get(pos..pos + 4)
+                            .ok_or_else(|| RamzError::Backend("truncated recipient file".into()))?;
+                        let ek_len = u32::from_le_bytes(ek_len_bytes.try_into().unwrap()) as usize;
                         pos += 4;
-                        let ek = pub_raw[pos..pos + ek_len].to_vec();
+                        let ek = pub_raw
+                            .get(pos..pos + ek_len)
+                            .ok_or_else(|| RamzError::Backend("truncated recipient file".into()))?
+                            .to_vec();
                         AgeBackend::new_with_recipient(ek)
                     } else if mlkem {
                         AgeBackend::new_with_mlkem()
@@ -753,6 +766,47 @@ mod tests {
                 argon2id: false,
                 mlkem: false,
                 recipient: Some(PathBuf::from("identity.pub")),
+                dry_run: false,
+                resume: false,
+                argon2_memory_kib: 65536,
+                argon2_iterations: 3,
+                argon2_parallelism: 4,
+            },
+        });
+        assert!(result.is_err());
+    }
+
+    // این تست دقیقاً باگی رو بازآفرینی می‌کنه که پیدا و رفع کردیم: فایل
+    // --recipient با ایندکس خام پارس می‌شد و یه فایل خراب/کوتاه‌شده باعث
+    // panic واقعی برنامه می‌شد به‌جای یه خطای تمیز
+    // this test reproduces the exact bug we found and fixed: the
+    // --recipient file was parsed with raw indexing and a corrupted/
+    // truncated file caused a real program panic instead of a clean error
+    #[test]
+    fn test_pack_with_corrupted_recipient_file_does_not_panic() {
+        let tmp = tempfile::TempDir::new().unwrap();
+        let source = tmp.path().join("data.txt");
+        std::fs::write(&source, b"some content").unwrap();
+
+        // فایل recipient جعلی و کوتاه‌شده - magic درست ولی هدر ناقص
+        // a fake, truncated recipient file - correct magic but incomplete header
+        let bad_recipient = tmp.path().join("bad.pub");
+        std::fs::write(&bad_recipient, b"RIM1PUB\x01").unwrap();
+
+        let result = run(Cli {
+            command: Commands::Pack {
+                source: source.clone(),
+                output: Some(tmp.path().to_path_buf()),
+                password: None,
+                confirm_password: false,
+                compression_level: None,
+                delete_source: false,
+                secure_delete: false,
+                force: true,
+                backend: BackendChoice::Age,
+                argon2id: false,
+                mlkem: false,
+                recipient: Some(bad_recipient),
                 dry_run: false,
                 resume: false,
                 argon2_memory_kib: 65536,

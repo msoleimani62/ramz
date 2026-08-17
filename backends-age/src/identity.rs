@@ -131,9 +131,11 @@ impl Identity {
         }
 
         let mut pos = RIM1PUB_MAGIC.len();
-        let ek_len = u32::from_le_bytes(pub_raw[pos..pos + 4].try_into().unwrap()) as usize;
-        pos += 4;
-        let ek = pub_raw[pos..pos + ek_len].to_vec();
+        let ek_len = read_u32(&pub_raw, &mut pos)? as usize;
+        let ek = pub_raw
+            .get(pos..pos + ek_len)
+            .ok_or_else(|| RamzError::Backend("truncated public identity file".into()))?
+            .to_vec();
 
         let mut sec_file = fs::File::open(sec_path)?;
         let mut sec_raw = Vec::new();
@@ -153,21 +155,28 @@ impl Identity {
             PROTECTION_NONE => {
                 // کلید مستقیم و بدون رمزنگاری ذخیره شده؛ فقط می‌خونیمش
                 // the key was stored directly, unencrypted; just read it
-                let dk_len = u32::from_le_bytes(sec_raw[pos..pos + 4].try_into().unwrap()) as usize;
-                pos += 4;
-                sec_raw[pos..pos + dk_len].to_vec()
+                let dk_len = read_u32(&sec_raw, &mut pos)? as usize;
+                sec_raw
+                    .get(pos..pos + dk_len)
+                    .ok_or_else(|| RamzError::Backend("truncated identity file".into()))?
+                    .to_vec()
             }
             PROTECTION_PASSWORD => {
                 // محافظت‌شده با پسورد: کلید از پسورد + salt مشتق و رمزگشایی می‌شه
                 // password-protected: derive the key from password + salt and decrypt
-                let salt = &sec_raw[pos..pos + 16];
+                let salt = sec_raw
+                    .get(pos..pos + 16)
+                    .ok_or_else(|| RamzError::Backend("truncated identity file".into()))?;
                 pos += 16;
-                let nonce: [u8; 12] = sec_raw[pos..pos + 12].try_into().unwrap();
+                let nonce_bytes = sec_raw
+                    .get(pos..pos + 12)
+                    .ok_or_else(|| RamzError::Backend("truncated identity file".into()))?;
+                let nonce: [u8; 12] = nonce_bytes.try_into().unwrap();
                 pos += 12;
-                let enc_len =
-                    u32::from_le_bytes(sec_raw[pos..pos + 4].try_into().unwrap()) as usize;
-                pos += 4;
-                let encrypted = &sec_raw[pos..pos + enc_len];
+                let enc_len = read_u32(&sec_raw, &mut pos)? as usize;
+                let encrypted = sec_raw
+                    .get(pos..pos + enc_len)
+                    .ok_or_else(|| RamzError::Backend("truncated identity file".into()))?;
 
                 let argon2_key = argon2_kdf::derive_key(password, salt, 65536, 3, 4)
                     .map_err(|e| RamzError::Backend(format!("identity key derivation: {}", e)))?;
@@ -197,6 +206,28 @@ fn generate_nonce() -> [u8; 12] {
     let mut nonce = [0u8; 12];
     OsRng.fill_bytes(&mut nonce);
     nonce
+}
+
+// BUGFIX: قبلاً همه‌ی این پارس‌ها با ایندکس مستقیم sec_raw[a..b] انجام
+// می‌شد که هیچ چک محدوده‌ای نداره - یه فایل identity خراب/دستکاری‌شده یا
+// کوتاه‌شده باعث panic (crash) واقعی برنامه می‌شد، نه یه خطای تمیز. این
+// تابع کمکی هم طول رو با bounds-check می‌خونه و هم جلوی سرریز pos+4 رو
+// می‌گیره (checked_add به‌جای جمع خام).
+//
+// BUGFIX: previously all of this parsing used raw sec_raw[a..b] indexing,
+// which has zero bounds checking - a corrupted/tampered or truncated
+// identity file caused a real program panic (crash), not a clean error.
+// This helper both reads the length with a bounds check and guards
+// against pos+4 overflow (checked_add instead of raw addition).
+fn read_u32(raw: &[u8], pos: &mut usize) -> Result<u32> {
+    let end = pos
+        .checked_add(4)
+        .ok_or_else(|| RamzError::Backend("truncated identity file".into()))?;
+    let bytes = raw
+        .get(*pos..end)
+        .ok_or_else(|| RamzError::Backend("truncated identity file".into()))?;
+    *pos = end;
+    Ok(u32::from_le_bytes(bytes.try_into().unwrap()))
 }
 
 #[cfg(test)]
@@ -277,6 +308,52 @@ mod tests {
         let dk_len = u32::from_le_bytes(raw[8..12].try_into().unwrap()) as usize;
         assert_eq!(dk_len, identity.decapsulation_key.len());
         assert_eq!(&raw[12..12 + dk_len], identity.decapsulation_key.as_slice());
+    }
+
+    // این تست دقیقاً باگی رو بازآفرینی می‌کنه که پیدا و رفع کردیم: پارس
+    // فایل identity با ایندکس خام sec_raw[a..b]/pub_raw[a..b] انجام می‌شد،
+    // بدون چک محدوده. یه فایل identity خراب یا کوتاه‌شده باعث panic واقعی
+    // برنامه می‌شد. الان باید فقط یه Result::Err تمیز برگرده.
+    // this test reproduces the exact bug we found and fixed: identity file
+    // parsing used raw sec_raw[a..b]/pub_raw[a..b] indexing with no bounds
+    // checking. A corrupted or truncated identity file caused a real
+    // program panic. It must now just return a clean Result::Err.
+    #[test]
+    fn test_load_truncated_identity_does_not_panic() {
+        let tmp = TempDir::new().unwrap();
+        let pub_path = tmp.path().join("identity.pub");
+        let sec_path = tmp.path().join("identity");
+
+        let identity = Identity::generate();
+        identity
+            .save(&pub_path, &sec_path, Some("mypassword"))
+            .unwrap();
+
+        // فایل کلید سری رو وسط راه قطع می‌کنیم
+        // truncate the secret key file mid-way
+        let full = fs::read(&sec_path).unwrap();
+        fs::write(&sec_path, &full[..full.len().min(12)]).unwrap();
+
+        let result = Identity::load_with_password(&pub_path, &sec_path, "mypassword");
+        assert!(result.is_err());
+    }
+
+    #[test]
+    fn test_load_truncated_public_identity_does_not_panic() {
+        let tmp = TempDir::new().unwrap();
+        let pub_path = tmp.path().join("identity.pub");
+        let sec_path = tmp.path().join("identity");
+
+        let identity = Identity::generate();
+        identity.save(&pub_path, &sec_path, None).unwrap();
+
+        // فایل کلید عمومی رو وسط راه قطع می‌کنیم
+        // truncate the public key file mid-way
+        let full = fs::read(&pub_path).unwrap();
+        fs::write(&pub_path, &full[..full.len().min(9)]).unwrap();
+
+        let result = Identity::load_with_password(&pub_path, &sec_path, "");
+        assert!(result.is_err());
     }
 
     #[test]

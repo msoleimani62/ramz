@@ -3,7 +3,7 @@ members = ["core", "backends-age", "backends-7z", "cli", "integration-tests"]
 resolver = "2"
 
 [workspace.package]
-version = "0.3.0"
+version = "0.3.1"
 authors = ["msoleimani62 <msoleimaniphone@gmail.com>"]
 edition = "2021"
 license = "MIT OR Apache-2.0"
@@ -11,10 +11,10 @@ repository = "https://github.com/msoleimani62/ramz"
 rust-version = "1.75"
 
 [workspace.dependencies]
-ramz-core = { path = "core", version = "0.3.0" }
-ramz-backends-age = { path = "backends-age", version = "0.3.0" }
-ramz-backend-7z = { path = "backends-7z", version = "0.3.0" }
-ramz-cli = { path = "cli", version = "0.3.0" }
+ramz-core = { path = "core", version = "0.3.1" }
+ramz-backends-age = { path = "backends-age", version = "0.3.1" }
+ramz-backend-7z = { path = "backends-7z", version = "0.3.1" }
+ramz-cli = { path = "cli", version = "0.3.1" }
 
 thiserror = "1"
 anyhow = "1"

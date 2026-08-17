@@ -252,10 +252,7 @@ impl AgeBackend {
         let iterations = read_u32(raw, &mut pos)?;
         let parallelism = read_u32(raw, &mut pos)?;
 
-        let salt = raw
-            .get(pos..pos + 16)
-            .ok_or_else(|| RamzError::Backend("truncated archive header".into()))?;
-        pos += 16;
+        let salt = read_slice(raw, &mut pos, 16)?;
 
         let mut final_key = Zeroizing::new([0u8; 32]);
 
@@ -264,11 +261,8 @@ impl AgeBackend {
                 RamzError::Backend("recipient archive requires --identity to decrypt".into())
             })?;
 
-            let ct_len = read_u32(raw, &mut pos)?;
-            let mlkem_ct = raw
-                .get(pos..pos + ct_len as usize)
-                .ok_or_else(|| RamzError::Backend("truncated archive header".into()))?;
-            pos += ct_len as usize;
+            let ct_len = read_u32(raw, &mut pos)? as usize;
+            let mlkem_ct = read_slice(raw, &mut pos, ct_len)?;
 
             let mlkem_shared =
                 mlkem_hybrid::decapsulate(identity.decapsulation_key.as_slice(), mlkem_ct)
@@ -283,29 +277,18 @@ impl AgeBackend {
                 argon2_kdf::derive_key(password, salt, memory_kib, iterations, parallelism)
                     .map_err(|e| RamzError::Backend(format!("argon2 derive: {}", e)))?;
 
-            let ct_len = read_u32(raw, &mut pos)?;
-            let mlkem_ct = raw
-                .get(pos..pos + ct_len as usize)
-                .ok_or_else(|| RamzError::Backend("truncated archive header".into()))?;
-            pos += ct_len as usize;
-
-            let dk_nonce = raw
-                .get(pos..pos + 12)
-                .ok_or_else(|| RamzError::Backend("truncated archive header".into()))?;
-            pos += 12;
-
-            let dk_enc_len = read_u32(raw, &mut pos)?;
-            let dk_encrypted = raw
-                .get(pos..pos + dk_enc_len as usize)
-                .ok_or_else(|| RamzError::Backend("truncated archive header".into()))?;
-            pos += dk_enc_len as usize;
+            let ct_len = read_u32(raw, &mut pos)? as usize;
+            let mlkem_ct = read_slice(raw, &mut pos, ct_len)?.to_vec();
+            let dk_nonce = read_slice(raw, &mut pos, 12)?.to_vec();
+            let dk_enc_len = read_u32(raw, &mut pos)? as usize;
+            let dk_encrypted = read_slice(raw, &mut pos, dk_enc_len)?;
 
             let wrap_cipher = ChaCha20Poly1305::new(Key::from_slice(argon2_key.as_slice()));
             let dk_bytes = wrap_cipher
-                .decrypt(Nonce::from_slice(dk_nonce), dk_encrypted)
+                .decrypt(Nonce::from_slice(&dk_nonce), dk_encrypted)
                 .map_err(|_| RamzError::Backend("wrong password or corrupted archive".into()))?;
 
-            let mlkem_shared = mlkem_hybrid::decapsulate(&dk_bytes, mlkem_ct)
+            let mlkem_shared = mlkem_hybrid::decapsulate(&dk_bytes, &mlkem_ct)
                 .map_err(|e| RamzError::Backend(format!("mlkem decapsulate: {}", e)))?;
 
             let combined = mlkem_hybrid::combine_secrets(argon2_key.as_slice(), &mlkem_shared);
@@ -321,12 +304,11 @@ impl AgeBackend {
             final_key.copy_from_slice(argon2_key.as_slice());
         }
 
-        let payload_nonce = raw
-            .get(pos..pos + 12)
-            .ok_or_else(|| RamzError::Backend("truncated archive header".into()))?;
-        pos += 12;
+        let payload_nonce = read_slice(raw, &mut pos, 12)?;
 
-        let ciphertext = &raw[pos..];
+        let ciphertext = raw
+            .get(pos..)
+            .ok_or_else(|| RamzError::Backend("truncated archive header".into()))?;
 
         let cipher = ChaCha20Poly1305::new(Key::from_slice(final_key.as_slice()));
         let compressed = cipher
@@ -376,12 +358,42 @@ fn generate_nonce() -> [u8; 12] {
     nonce
 }
 
+// BUGFIX: `*pos + 4` و مشابهش در ادامه‌ی این فایل جمع خام بودن - روی یه
+// هدر آرشیو خراب/بدخواهانه با مقادیر طول (length) دستکاری‌شده، این جمع‌ها
+// می‌تونستن overflow کنن و توی build دیباگ (که overflow-checks روشنه)
+// panic بدن، یعنی یه آرشیو ورودی خراب می‌تونست برنامه رو کرش کنه به‌جای
+// این‌که فقط خطای تمیز برگردونه. با checked_add جلوش گرفته شده.
+//
+// BUGFIX: `*pos + 4` and similar additions further in this file were raw
+// arithmetic - on a corrupted/malicious archive header with tampered
+// length fields, these additions could overflow and panic in a debug
+// build (where overflow-checks are on), meaning a corrupted input archive
+// could crash the program instead of just returning a clean error. Now
+// guarded with checked_add.
 fn read_u32(raw: &[u8], pos: &mut usize) -> Result<u32> {
-    let bytes = raw
-        .get(*pos..*pos + 4)
+    let end = pos
+        .checked_add(4)
         .ok_or_else(|| RamzError::Backend("truncated archive header".into()))?;
-    *pos += 4;
+    let bytes = raw
+        .get(*pos..end)
+        .ok_or_else(|| RamzError::Backend("truncated archive header".into()))?;
+    *pos = end;
     Ok(u32::from_le_bytes(bytes.try_into().unwrap()))
+}
+
+// خواندن امنِ یک برش با طول دلخواه از pos فعلی، با محافظت در برابر
+// سرریز pos+len و هم محدوده‌ی خارج از آرایه
+// safely read a slice of arbitrary length from the current pos, guarded
+// against both pos+len overflow and out-of-bounds ranges
+fn read_slice<'a>(raw: &'a [u8], pos: &mut usize, len: usize) -> Result<&'a [u8]> {
+    let end = pos
+        .checked_add(len)
+        .ok_or_else(|| RamzError::Backend("truncated archive header".into()))?;
+    let slice = raw
+        .get(*pos..end)
+        .ok_or_else(|| RamzError::Backend("truncated archive header".into()))?;
+    *pos = end;
+    Ok(slice)
 }
 
 fn decompress_zstd(compressed: &[u8]) -> Result<Vec<u8>> {
@@ -889,6 +901,52 @@ mod tests {
             .unwrap();
 
         let result = backend.verify(&archive, None);
+        assert!(result.is_err());
+    }
+
+    // این تست دقیقاً باگی رو بازآفرینی می‌کنه که پیدا و رفع کردیم: هدر
+    // آرشیوهای سفارشی RMZ1 با ایندکس خام raw[a..b] پارس می‌شد، بدون هیچ
+    // چک محدوده‌ای. یه آرشیو خراب/دستکاری‌شده (کوتاه‌شده وسط هدر) باعث
+    // panic واقعی برنامه می‌شد، نه یه Result::Err تمیز. الان باید فقط
+    // خطای Backend برگرده، بدون کرش.
+    // this test reproduces the exact bug we found and fixed: RMZ1 custom
+    // container headers were parsed with raw raw[a..b] indexing, with zero
+    // bounds checking. A corrupted/tampered archive (truncated mid-header)
+    // caused a real program panic, not a clean Result::Err. It must now
+    // just return a Backend error, without crashing.
+    #[test]
+    fn test_corrupted_custom_container_header_does_not_panic() {
+        let tmp = TempDir::new().unwrap();
+        let file = tmp.path().join("secret.txt");
+        let mut f = fs::File::create(&file).unwrap();
+        f.write_all(b"data").unwrap();
+        let archive = tmp.path().join("secret.age.tar.zst");
+
+        let target = Target::detect(&file).unwrap();
+        let backend = AgeBackend::new_with_argon2id();
+        let opts = PackOptions {
+            password: Some("password".to_string()),
+            compression_level: 3,
+            delete_source: false,
+            output_dir: Some(tmp.path().to_path_buf()),
+            force_overwrite: true,
+            argon2_memory_kib: 65536,
+            argon2_iterations: 3,
+            argon2_parallelism: 4,
+            secure_delete: false,
+        };
+        let mut progress = NullProgress;
+        backend
+            .pack(&target, &archive, &opts, &mut progress)
+            .unwrap();
+
+        // هدر رو وسط راه قطع می‌کنیم - نباید panic بده، فقط باید Err برگردونه
+        // truncate the header mid-way - must not panic, must just return Err
+        let full = fs::read(&archive).unwrap();
+        let truncated = &full[..full.len().min(10)];
+        fs::write(&archive, truncated).unwrap();
+
+        let result = backend.verify(&archive, Some("password"));
         assert!(result.is_err());
     }
 }

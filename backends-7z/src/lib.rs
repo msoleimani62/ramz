@@ -47,6 +47,24 @@ impl Backend for SevenZBackend {
             .arg(format!("-mx={}", opts.compression_level.clamp(0, 9)))
             .arg("-bsp1");
 
+        // ⚠️ محدودیت شناخته‌شده و مستندنشده: پسورد این‌جا به‌عنوان یه
+        // آرگومان خط‌فرمان (-p{pw}) به باینری 7z پاس داده می‌شه. روی هر
+        // سیستم چندکاربره، بقیه‌ی کاربران می‌تونن پسورد رو در کوتاه‌مدت
+        // (تا وقتی پروسه در حال اجراست) از طریق `ps aux` یا
+        // `/proc/<pid>/cmdline` ببینن. این محدودیت خودِ باینری 7z/p7zip‌ه -
+        // هیچ راه رسمی برای پاس دادن پسورد از stdin/env به 7z نیست، پس با
+        // shell کردن به یه باینری خارجی این ریسک قابل حذف نیست، فقط قابل
+        // مستندسازیه. باید توی README به‌عنوان یه محدودیت شناخته‌شده ذکر بشه.
+        //
+        // ⚠️ known, undocumented limitation: the password is passed here as
+        // a command-line argument (-p{pw}) to the 7z binary. On any
+        // multi-user system, other local users can briefly (while the
+        // process is running) see the password via `ps aux` or
+        // `/proc/<pid>/cmdline`. This is a limitation of the 7z/p7zip
+        // binary itself - there is no official way to feed 7z a password
+        // via stdin/env, so shelling out to an external binary cannot
+        // eliminate this risk, only document it. This should be called out
+        // as a known limitation in the README.
         if let Some(pw) = &opts.password {
             cmd.arg("-mhe=on").arg(format!("-p{pw}"));
         }
@@ -115,6 +133,8 @@ impl Backend for SevenZBackend {
         let mut cmd = Command::new(&binary);
         cmd.arg("t").arg(archive_path);
         if let Some(pw) = password {
+            // همون محدودیت expose شدن پسورد در process list که بالاتر توضیح داده شد
+            // same password-in-process-list exposure explained above
             cmd.arg(format!("-p{pw}"));
         }
         cmd.stdout(Stdio::null()).stderr(Stdio::piped());
@@ -145,6 +165,8 @@ impl Backend for SevenZBackend {
             .arg("-y");
 
         if let Some(pw) = password {
+            // همون محدودیت expose شدن پسورد در process list که بالاتر توضیح داده شد
+            // same password-in-process-list exposure explained above
             cmd.arg(format!("-p{pw}"));
         }
 

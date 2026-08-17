@@ -2,7 +2,16 @@
 
 All notable changes to this project will be documented in this file.
 
-## [0.3.0] - 2026-07-22
+## [0.3.1] - 2026-08-17
+
+### Fixed
+- **`compute_file_checksum()` for directory sources was not recursive**: it only listed the top level with `fs::read_dir`, silently ignoring every file inside subdirectories. As a result, `--resume` and `verify_source_unchanged()` could report a directory source as "unchanged" even though a nested file had been added, removed, or modified — the exact same class of bug the 0.2.2 resume fix addressed, but for a case that bug's tests never covered. Now walks the full tree recursively with `walkdir` and hashes each file's relative path (so renames are also detected) alongside its content. Added a regression test (`test_compute_file_checksum_detects_nested_change`).
+- **Malformed/truncated identity and archive-header files could crash the program (`panic`) instead of returning a clean error**: `Identity::load_with_password()`, the `--recipient` public-key parser in the CLI, and `decrypt_custom_container()`'s `RMZ1` header parser all indexed raw byte slices directly (`raw[a..b]`) with no bounds checking. A corrupted, truncated, or adversarially crafted identity/archive/recipient file would trigger an out-of-bounds index panic — a real crash, not a `Result::Err` — anywhere these files are handled. All three now use bounds-checked (`.get()`/`checked_add`) parsing and return `RamzError::Backend` on malformed input. Added regression tests: `test_corrupted_custom_container_header_does_not_panic`, `test_load_truncated_identity_does_not_panic`, `test_load_truncated_public_identity_does_not_panic`, `test_pack_with_corrupted_recipient_file_does_not_panic`.
+
+### Security
+- Documented (in-code, `backends-7z/src/lib.rs`) a known, previously-unstated limitation: the `7z` backend passes the password to the external `7z`/`7zz`/`7za` binary as a command-line argument, which is briefly visible to other local users on the same machine via `ps aux` or `/proc/<pid>/cmdline` while the process runs. This is a limitation of the external 7z binary itself (it has no stdin/env password input) and cannot be eliminated while shelling out to it — only documented. No code behavior changed.
+
+## [0.3.0] - 2026-07-24
 
 ### Added
 - **Recipient-based encryption (`ramz keygen`, `--recipient`)**: True post-quantum encryption where only the holder of the identity secret key can decrypt. No password involved in the encryption path.

@@ -2,6 +2,11 @@
 
 All notable changes to this project will be documented in this file.
 
+## [0.3.2] - 2026-08-17
+
+### Documentation
+- Added a "Known limitations" subsection to the Security design section of the (bilingual) README, covering: the `7z` backend's password-visible-in-process-list limitation (previously only noted as a code comment, not in user-facing docs), the lack of true streaming for very large files, and the fact that the `RMZ1`/`RIM1` formats have not had an independent security review. No code changes.
+
 ## [0.3.1] - 2026-08-17
 
 ### Fixed

@@ -134,6 +134,25 @@ guarantee.
 `--argon2id`, `--mlkem`, and `--recipient` currently apply to the `age`
 backend only. The `7z` backend does not support them.
 
+#### Known limitations
+
+- **`7z` backend: password briefly visible to other local users.** The
+  `7z` backend shells out to the system `7z`/`7zz`/`7za` binary and
+  passes the password as a command-line argument (`-p<password>`).
+  While the process is running, other users on the same multi-user
+  machine can see it via `ps aux` or `/proc/<pid>/cmdline`. This is a
+  limitation of the external `7z` binary itself — it has no way to
+  accept a password from stdin or an environment variable — so it
+  cannot be fixed by ramz without dropping 7z compatibility entirely.
+  If this matters for your threat model, use the `age` backend
+  instead, where the password never appears as a process argument.
+- **No streaming for very large files.** The current pipeline buffers
+  the whole compressed payload in memory/a temp file rather than
+  processing it as a true stream. See the roadmap.
+- **The `RMZ1`/`RIM1` binary formats have not had an independent
+  security review.** They are custom formats, not an established
+  standard like plain `age`. See the roadmap.
+
 ### Installation
 
 #### Build from source
@@ -458,6 +477,24 @@ recipient-key. به ازای هر آرشیو، یه جفت‌کلید تازه�
 
 `--argon2id`، `--mlkem`، و `--recipient` فعلاً فقط روی بک‌اند `age`
 کار می‌کنن. بک‌اند `7z` ازشون پشتیبانی نمی‌کنه.
+
+#### محدودیت‌های شناخته‌شده
+
+- **بک‌اند `7z`: پسورد به‌طور موقت در معرض دید بقیه‌ی کاربران محلیه.**
+  بک‌اند `7z` به باینری سیستمی `7z`/`7zz`/`7za` شل می‌کنه و پسورد رو
+  به‌عنوان یه آرگومان خط‌فرمان (`-p<password>`) پاس می‌ده. تا وقتی
+  پروسه در حال اجراست، بقیه‌ی کاربرها روی همون سیستم چندکاربره می‌تونن
+  با `ps aux` یا `/proc/<pid>/cmdline` ببیننش. این محدودیت خودِ باینری
+  `7z`‌ه — هیچ راهی برای گرفتن پسورد از stdin یا متغیر محیطی نداره —
+  پس ramz نمی‌تونه بدون کنار گذاشتن کامل سازگاری با 7z این رو رفع کنه.
+  اگه این برای مدل تهدید شما مهمه، به‌جاش از بک‌اند `age` استفاده کن؛
+  اونجا پسورد هیچ‌وقت به‌صورت آرگومان پروسه ظاهر نمی‌شه.
+- **بدون streaming واقعی برای فایل‌های خیلی بزرگ.** pipeline فعلی کل
+  محتوای فشرده‌شده رو توی RAM/یه فایل موقت بافر می‌کنه، نه پردازش
+  واقعی به‌صورت جریانی. به نقشه‌راه نگاه کن.
+- **فرمت‌های باینری `RMZ1`/`RIM1` هنوز بررسی امنیتی مستقل نشدن.** این‌ها
+  فرمت‌های خودساخته‌ان، نه یه استاندارد جاافتاده مثل `age` خالص. به
+  نقشه‌راه نگاه کن.
 
 ### نصب
 
